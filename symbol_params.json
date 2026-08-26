@@ -1,0 +1,23 @@
+{
+  "BTC/USDT": {
+    "SWING_LEN": 5,
+    "NW_MULT": 2.0,
+    "ST_ATR_PERIOD": 10,
+    "ST_ATR_MULT": 4.0,
+    "ST_INIT_STOP": 5.0
+  },
+  "ETH/USDT": {
+    "SWING_LEN": 3,
+    "NW_MULT": 3.0,
+    "ST_ATR_PERIOD": 10,
+    "ST_ATR_MULT": 4.0,
+    "ST_INIT_STOP": 5.0
+  },
+  "SOL/USDT": {
+    "SWING_LEN": 3,
+    "NW_MULT": 3.0,
+    "ST_ATR_PERIOD": 14,
+    "ST_ATR_MULT": 4.0,
+    "ST_INIT_STOP": 5.0
+  }
+}
