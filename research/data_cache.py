@@ -28,7 +28,7 @@ import config  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(HERE, "data")
-TF_MS = {"5m": 300_000, "30m": 1_800_000}
+TF_MS = {"5m": 300_000, "15m": 900_000, "30m": 1_800_000, "1h": 3_600_000}
 
 
 def _cache_path(symbol, timeframe):
