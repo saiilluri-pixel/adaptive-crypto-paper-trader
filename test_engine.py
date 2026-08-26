@@ -1,8 +1,11 @@
 """
 Deterministic tests for engine.py: fee/PnL accounting (item 3), stop-fill
-price correctness (item 2), risk-based sizing (item 4), and risk guards
-(item 5) of the merge. No network calls.
+price correctness (item 2), risk-based sizing (item 4), risk guards (item 5),
+and the injectable simulated-clock fix (Phase 2 day-rollover defect). No
+network calls.
 """
+from datetime import datetime, timezone
+
 import pytest
 
 import config
@@ -306,3 +309,52 @@ def test_risk_guards_never_block_managing_an_open_position():
     stop = eng.pos.tsl.sl_price
     eng.check_stop_intrabar(stop - 1.0)    # exit management must still work while guards are active
     assert eng.pos is None
+
+
+# ── Injectable simulated clock (Phase 2 day-rollover defect fix) ───────
+
+def test_default_now_fn_uses_real_wall_clock_time():
+    """No now_fn passed (run.py's live path never passes one) -> the engine
+    must use real wall-clock time, exactly as before this fix. This is the
+    behavior that must NEVER change for live trading."""
+    eng = PaperEngine(log_fn=lambda m: None, log_trades=False)
+    before = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    assert eng._now_fn().strftime("%Y-%m-%d") == before
+    eng._roll_day_if_needed()
+    assert eng.trading_day == before
+
+
+def test_injected_now_fn_drives_day_rollover_in_backtests():
+    """A backtest-style caller injects the simulated bar's timestamp. Day
+    rollover must follow THAT clock, not real wall-clock time -- proving the
+    fix actually solves the permanent-lockout defect found in Phase 2."""
+    sim_day = {"dt": datetime(2020, 1, 1, tzinfo=timezone.utc)}
+    eng = PaperEngine(log_fn=lambda m: None, log_trades=False, now_fn=lambda: sim_day["dt"])
+    eng.consecutive_losses = config.CONSECUTIVE_LOSS_LIMIT
+    eng._roll_day_if_needed()
+    assert eng.trading_day == "2020-01-01"
+    assert eng.consecutive_losses == config.CONSECUTIVE_LOSS_LIMIT   # first check just initializes
+
+    # advance the SIMULATED clock by one day (real wall-clock time is irrelevant here)
+    sim_day["dt"] = datetime(2020, 1, 2, tzinfo=timezone.utc)
+    eng._roll_day_if_needed()
+    assert eng.trading_day == "2020-01-02"
+    assert eng.consecutive_losses == 0   # rolled over on SIMULATED day change, guard clears
+
+
+def test_injected_clock_prevents_permanent_backtest_lockout():
+    """Direct regression test for the Phase 2 defect: without a simulated
+    clock, 5 losses at the same real-world instant would lock out entries
+    forever (no wall-clock day ever passes during a fast backtest). With the
+    simulated clock advancing per bar, the guard clears once the simulated
+    day rolls over, even though real time barely moved."""
+    sim_day = {"dt": datetime(2020, 1, 1, tzinfo=timezone.utc)}
+    eng = PaperEngine(log_fn=lambda m: None, log_trades=False, now_fn=lambda: sim_day["dt"])
+    for _ in range(config.CONSECUTIVE_LOSS_LIMIT):
+        eng.enter("long", 100.0, "BUY", 1)
+        eng.close(99.0, "loss")   # a real, wall-clock-instant loss each time
+    assert eng.consecutive_losses >= config.CONSECUTIVE_LOSS_LIMIT
+    assert eng._risk_guard_blocked() is not None   # correctly blocked, same simulated day
+
+    sim_day["dt"] = datetime(2020, 1, 2, tzinfo=timezone.utc)   # simulated bar crosses midnight
+    assert eng._risk_guard_blocked() is None        # cleared -- would have stayed blocked forever pre-fix

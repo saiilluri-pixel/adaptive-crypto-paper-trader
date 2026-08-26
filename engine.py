@@ -37,7 +37,16 @@ class Position:
 
 class PaperEngine:
     def __init__(self, log_fn=print, log_trades=True, symbol=None, params=None,
-                 exit_on_flip=None, arm_flip=None, file_tag=None):
+                 exit_on_flip=None, arm_flip=None, file_tag=None, now_fn=None):
+        # now_fn: returns the "current" datetime used for day-rollover bookkeeping
+        # (risk guards). Defaults to real wall-clock time, correct for live
+        # trading. Backtest/research callers may inject a function returning
+        # the simulated bar's timestamp instead -- otherwise wall-clock time
+        # barely advances while a whole backtest year is replayed in seconds,
+        # so the daily reset that's supposed to clear consecutive_losses never
+        # fires and a guard trip early in the run permanently blocks the rest
+        # of the simulated period.
+        self._now_fn = now_fn or (lambda: datetime.now(timezone.utc))
         self.cash = config.START_CAPITAL
         self.equity = config.START_CAPITAL
         self.pos = None
@@ -160,7 +169,7 @@ class PaperEngine:
 
     # ── risk guards (entries only) ────────────────────────────────
     def _roll_day_if_needed(self):
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        today = self._now_fn().strftime("%Y-%m-%d")
         if self.trading_day is None:
             # first check on a freshly constructed engine -- initialize only,
             # do not treat this as a rollover (would wipe a restored streak)

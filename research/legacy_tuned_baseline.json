@@ -1,0 +1,72 @@
+{
+  "symbols": [
+    "BTC/USDT",
+    "ETH/USDT",
+    "SOL/USDT"
+  ],
+  "chart_tf": "5m",
+  "structure_tf": "30m",
+  "global_defaults": {
+    "SWING_LEN": 5,
+    "NW_BANDWIDTH": 4.0,
+    "NW_MULT": 2.0,
+    "NW_WINDOW": 500,
+    "ST_ATR_PERIOD": 14,
+    "ST_ATR_MULT": 4.0,
+    "ST_INIT_STOP": 5.0
+  },
+  "symbol_params_tuned": {
+    "BTC/USDT": {
+      "SWING_LEN": 5,
+      "NW_MULT": 2.0,
+      "ST_ATR_PERIOD": 10,
+      "ST_ATR_MULT": 4.0,
+      "ST_INIT_STOP": 5.0
+    },
+    "ETH/USDT": {
+      "SWING_LEN": 3,
+      "NW_MULT": 3.0,
+      "ST_ATR_PERIOD": 10,
+      "ST_ATR_MULT": 4.0,
+      "ST_INIT_STOP": 5.0
+    },
+    "SOL/USDT": {
+      "SWING_LEN": 3,
+      "NW_MULT": 3.0,
+      "ST_ATR_PERIOD": 14,
+      "ST_ATR_MULT": 4.0,
+      "ST_INIT_STOP": 5.0
+    }
+  },
+  "risk": {
+    "RISK_PCT_PER_TRADE": 1.0,
+    "POSITION_PCT": 1.0,
+    "MAX_DRAWDOWN_PCT": 20.0,
+    "DAILY_LOSS_LIMIT_PCT": 5.0,
+    "CONSECUTIVE_LOSS_LIMIT": 5
+  },
+  "fee_taker": 0.0004,
+  "slippage": 0.0002,
+  "start_capital": 10000.0,
+  "exit_on_flip": true,
+  "arm_flip_after_entry": true,
+  "variants": {
+    "A": {
+      "label": "Profit-tuned (slow exits)",
+      "exit_on_flip": true,
+      "arm_flip": true,
+      "overrides": {}
+    },
+    "B": {
+      "label": "More trades (tight stop, no arm-delay)",
+      "exit_on_flip": true,
+      "arm_flip": false,
+      "overrides": {
+        "ST_INIT_STOP": 2.0,
+        "ST_ATR_PERIOD": 3
+      }
+    }
+  },
+  "symbol_params_json_last_modified": "Jun 21 19:07:13 2026 (verified via file mtime -- NOT Jun 19 as code comments imply)",
+  "tuning_run_that_produced_current_symbol_params": "autotune_all.txt (per-symbol, 2026-06-21) -- supersedes the earlier autotune_out.txt (global, 2026-06-19)"
+}
