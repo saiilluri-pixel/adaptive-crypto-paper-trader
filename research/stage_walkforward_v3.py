@@ -33,18 +33,33 @@ MIN_TRADES_TRAIN, MIN_TRADES_VAL = 10, 4
 TARGET_FOLDS = 8
 
 
-def fold_windows(data_start_ms, dev_end_ms):
+def fold_windows(data_start_ms, dev_end_ms, target_folds=TARGET_FOLDS):
+    """Evenly spreads target_folds test-windows across the FULL available
+    range [data_start_ms, dev_end_ms], rather than stepping forward by a
+    fixed TEST_DAYS from the start and stopping once target_folds is hit --
+    that approach silently clusters every fold in the earliest slice of a
+    long history whenever step*target_folds << total_range (a real defect
+    found and fixed during V3.1's pre-deployment leakage check: the
+    "expanded 16-fold" walk-forward on 5 years of data actually only ever
+    covered 2021-08 through 2022-10, not the full range, materially
+    overstating SOL's apparent edge until corrected)."""
     span = (TRAIN_DAYS + VAL_DAYS + TEST_DAYS) * DAY_MS
-    step = TEST_DAYS * DAY_MS
+    total_range = dev_end_ms - data_start_ms
+    if total_range < span:
+        return []
+    max_start = dev_end_ms - span
+    if target_folds == 1 or max_start <= data_start_ms:
+        starts = [data_start_ms]
+    else:
+        step = (max_start - data_start_ms) / (target_folds - 1)
+        starts = [int(data_start_ms + i * step) for i in range(target_folds)]
     folds = []
-    start = data_start_ms
-    while start + span <= dev_end_ms and len(folds) < TARGET_FOLDS:
+    for start in starts:
         train_start = start
         train_end = train_start + TRAIN_DAYS * DAY_MS
         val_end = train_end + VAL_DAYS * DAY_MS
         test_end = val_end + TEST_DAYS * DAY_MS
         folds.append((train_start, train_end, val_end, test_end))
-        start += step
     return folds
 
 
