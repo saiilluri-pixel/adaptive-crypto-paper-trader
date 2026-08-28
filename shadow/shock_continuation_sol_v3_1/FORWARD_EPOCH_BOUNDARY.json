@@ -1,0 +1,11 @@
+{
+  "forward_epoch_start_iso": "2026-08-28T01:00:00Z",
+  "forward_epoch_start_ts_ms": 1787878800000,
+  "definition": "First market bar eligible for forward validation",
+  "exclude_phases": ["warmup"],
+  "notes": "catchup bars after this timestamp remain valid forward observations",
+  "derivation": "Last phase=warmup event in events.csv closed at 2026-08-28T00:00:00Z (market_ts_ms=1787875200000); the next 1h bar, 2026-08-28T01:00:00Z, is the first bar processed after the initial bootstrap warmup completed and is the true forward-epoch boundary.",
+  "do_not_use": "state.json's epoch_start_iso field (2026-08-28T00:47:13Z at initial deployment) is PROCESS CONSTRUCTION WALL-CLOCK TIME, not a market-bar boundary. It must never be used to filter events.csv/trades.csv by market time -- use forward_epoch_start_ts_ms in this file instead.",
+  "pinned_by_commit": "cf487952caa82c3611f2c18caebb7148b35a31f6",
+  "pinned_at_iso": "2026-08-28T01:11:00Z"
+}

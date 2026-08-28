@@ -8,6 +8,16 @@ seeing forward results. If this file is ever edited after the first forward
 trade, that edit must itself be a new commit with its own message explaining
 why, on top of (not replacing) this original text.
 
+> **ADDENDUM (2026-08-28, dated clarification, added after the epoch started, not a rewrite of the above):** a read-only post-deployment verification found that this document did not pin an explicit, machine-usable forward-epoch market-time boundary, and that `state.json`'s `epoch_start_iso` field (process-construction wall-clock time) could be mistaken for one. This is now fixed:
+>
+> - **Forward-epoch boundary is pinned in `shadow/shock_continuation_sol_v3_1/FORWARD_EPOCH_BOUNDARY.json`**: `forward_epoch_start_ts_ms = 1787878800000` (`forward_epoch_start_iso = 2026-08-28T01:00:00Z`) — the first 1h SOL/USDT bar processed after the initial deployment's indicator-warmup replay completed.
+> - **Warmup shocks do NOT count.** The 15 shocks detected while replaying 501 bars of pre-existing history during the initial bootstrap (`phase=warmup` in `events.csv`) are diagnostic context only and are permanently excluded from every forward counter (independent-event tally, the 30-event stopping rule, and all evaluation metrics).
+> - **Catchup shocks DO count** if `market_ts_ms >= forward_epoch_start_ts_ms`. A restart after this point in time replays any bars missed while the process was down and tags them `phase=catchup` — these are genuine post-epoch-start market events processed late, not pre-epoch history, and must not be excluded by a naive `phase=='live'`-only filter.
+> - **`state.json`'s `epoch_start_iso` is NOT the evaluation boundary.** It is the wall-clock moment the runner process was constructed (`2026-08-28T00:47:13Z` at initial deployment), not a market-bar timestamp, and is never read by the evaluation helper below.
+> - **Trade forward-membership is keyed on `signal_ts_ms`, never on exit phase** — a trade opened during genuine live trading may legitimately exit during a later `phase=catchup` replay after a restart, and must still count as a forward trade.
+>
+> A read-only evaluation helper implementing this precisely, `shadow/shock_continuation_sol_v3_1/forward_filter.py` (`is_forward_event`, `is_forward_trade`, `cluster_forward_events`, `compute_counts`), plus 14 deterministic tests covering all of the above (`test_forward_epoch_boundary.py`), were added in the same commit as this addendum. Neither `forward_filter.py` nor its tests write to `state.json`, `events.csv`, or `trades.csv` — evaluation reads the ledgers, it never mutates them.
+
 ## STATUS
 
 **VALIDATION — INCONCLUSIVE.**

@@ -401,13 +401,52 @@ REAL_SHADOW_RUNTIME_FILES = (
 )
 
 
-def test_tests_do_not_touch_the_real_shadow_runtime_directory():
-    """The full test suite above only ever constructs ShadowRunner with a
-    tmp_path runtime_dir -- the real shadow/shock_continuation_sol_v3_1/
-    directory must contain no runtime output as a result of running tests."""
+def test_tests_never_construct_a_runner_against_the_real_shadow_directory():
+    """The real shadow/shock_continuation_sol_v3_1/ directory now legitimately
+    contains runtime output -- com.btcpaper.shocksol is deployed and running
+    there for real, so file-existence is no longer a valid proxy (it would be
+    true regardless of what this test suite does). The actual invariant this
+    suite must uphold is structural: no test in this file ever constructs a
+    ShadowRunner pointed at SHADOW_DIR/HERE -- every one of them passes a
+    tmp_path-derived runtime_dir. Checked statically, independent of whatever
+    the live deployment has since written there."""
+    this_file = os.path.join(ROOT, "test_shadow_shock_sol.py")
+    with open(this_file) as f:
+        lines = f.readlines()
+    # exclude this function's own body -- otherwise the banned patterns
+    # below match themselves as string literals, not real call sites
+    own_start = next(i for i, l in enumerate(lines) if "def test_tests_never_construct" in l)
+    own_end = next(i for i in range(own_start + 1, len(lines))
+                    if lines[i].startswith("def ") or lines[i].startswith("REAL_SHADOW"))
+    src = "".join(lines[:own_start] + lines[own_end:])
+    banned = "runtime_dir" + "=" + "SHADOW_DIR", "runtime_dir" + "=" + "HERE"
+    for token in banned:
+        assert token not in src, f"found {token!r} -- a test constructs a runner against the real shadow dir"
+
+
+def test_real_shadow_runtime_files_unmodified_by_this_test_run():
+    """A stronger, still deployment-status-independent check: snapshot the
+    real runtime files' mtimes, run a throwaway ShadowRunner against a
+    tmp_path, and confirm the real files' mtimes did not change as a result
+    -- proves this suite's own execution has zero side effect on them,
+    regardless of what the live service concurrently does on its own."""
+    before = {}
     for name in REAL_SHADOW_RUNTIME_FILES:
-        assert not os.path.exists(os.path.join(SHADOW_DIR, name)), (
-            f"{name} exists in the real shadow runtime dir -- a test wrote there")
+        p = os.path.join(SHADOW_DIR, name)
+        if os.path.exists(p):
+            before[name] = os.path.getmtime(p)
+
+    runner, feed, chart = _bootstrap_calm_runner_dir(tempfile_dir=None)
+
+    for name, mtime in before.items():
+        p = os.path.join(SHADOW_DIR, name)
+        assert os.path.getmtime(p) == mtime, f"{name} mtime changed -- something wrote to the real runtime dir"
+
+
+def _bootstrap_calm_runner_dir(tempfile_dir):
+    import tempfile
+    d = tempfile_dir or tempfile.mkdtemp()
+    return _bootstrap_calm_runner(d)
 
 
 def test_shadow_source_never_references_legacy_runtime_paths():
