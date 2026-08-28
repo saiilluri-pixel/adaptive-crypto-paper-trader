@@ -18,6 +18,13 @@ research/data/
 research/reports/*.html
 research/reports/*.json
 
+# Shock-continuation forward-shadow runtime (regenerated; never source-of-truth
+# -- state.json/paper.log/trades*.csv/equity*.csv already covered above since
+# those patterns have no leading slash and match at any depth)
+shadow/*/events.csv
+shadow/*/config_snapshot.json
+shadow/*/*.tmp
+
 # Python
 __pycache__/
 *.pyc
