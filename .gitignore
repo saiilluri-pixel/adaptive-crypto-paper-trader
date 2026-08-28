@@ -24,6 +24,7 @@ research/reports/*.json
 shadow/*/events.csv
 shadow/*/config_snapshot.json
 shadow/*/*.tmp
+shadow/*/diagnostics/*.jsonl
 
 # Python
 __pycache__/
