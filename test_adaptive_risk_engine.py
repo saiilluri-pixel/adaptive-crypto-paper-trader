@@ -152,6 +152,44 @@ def test_halted_state_blocks_all_new_entries_regardless_of_confidence():
     assert not r.approved
 
 
+def test_exploration_risk_capped_at_point_one_percent():
+    from adaptive.risk_engine import EXPLORATION_RISK_PER_TRADE_PCT
+    assert EXPLORATION_RISK_PER_TRADE_PCT == pytest.approx(0.10)
+    eng = _engine()
+    r = eng.size_exploration_entry(equity=10000, cash=10000, current_portfolio_heat_usdt=0,
+                                    current_crypto_value_usdt=0, stop_distance_frac=0.05, confidence=0.8)
+    assert r.approved
+    assert r.risk_amount_usdt == pytest.approx(10000 * 0.001)  # 0.10% of equity
+    assert r.binding_constraint.startswith("exploration:")
+
+
+def test_exploration_risk_five_times_smaller_than_normal():
+    eng = _engine()
+    normal = eng.size_entry(equity=10000, cash=10000, current_portfolio_heat_usdt=0,
+                             current_crypto_value_usdt=0, stop_distance_frac=0.05, confidence=0.8)
+    exploration = eng.size_exploration_entry(equity=10000, cash=10000, current_portfolio_heat_usdt=0,
+                                              current_crypto_value_usdt=0, stop_distance_frac=0.05, confidence=0.8)
+    assert exploration.risk_amount_usdt == pytest.approx(normal.risk_amount_usdt / 5)
+
+
+def test_exploration_still_respects_portfolio_heat_cap():
+    eng = _engine(max_portfolio_heat_pct=1.5)
+    # heat already fully used by normal-sized positions -- exploration must not bypass this
+    r = eng.size_exploration_entry(equity=10000, cash=10000, current_portfolio_heat_usdt=150.0,
+                                    current_crypto_value_usdt=2000, stop_distance_frac=0.05, confidence=0.8)
+    assert not r.approved
+
+
+def test_exploration_blocked_in_halted_state():
+    """Normal risk guards still apply to exploration -- it never bypasses
+    basic risk management, including the degradation state machine."""
+    eng = _engine()
+    eng.set_state(DegradationState.HALTED, "test")
+    r = eng.size_exploration_entry(equity=10000, cash=10000, current_portfolio_heat_usdt=0,
+                                    current_crypto_value_usdt=0, stop_distance_frac=0.05, confidence=1.0)
+    assert not r.approved
+
+
 def test_defensive_state_requires_high_confidence():
     eng = _engine()
     eng.set_state(DegradationState.DEFENSIVE, "test")

@@ -217,6 +217,171 @@ def test_research_process_cannot_touch_portfolio_position_state(tmp_path):
     assert runner.portfolio.positions["BTC/USDT"].strategy == "trend_momentum"  # unchanged
 
 
+def _fresh_dip_bar(ex, symbol, now, tf_key="15m"):
+    """Appends a genuine fresh, sharply oversold bar for `symbol` (mirrors
+    the real production mean_reversion signals seen in decisions.jsonl) on
+    `tf_key`, and ALSO refreshes the 5m series to the same new_now so
+    market_quality's staleness check (which reads PRIMARY_STOP_TF="5m")
+    doesn't reject the symbol as stale -- advancing only the 15m clock
+    without a matching fresh 5m bar leaves 5m data older than the default
+    10-minute staleness threshold. Returns the new now_ms."""
+    tf_ms = TF_MS[tf_key]
+    new_now = now + tf_ms
+    ex._now_ms = new_now
+    new_bar_ts = now - (now % tf_ms)
+    series = list(ex.candles_by_key[(symbol, tf_key)])
+    last_close = series[-1][4]
+    dip_close = last_close * 0.90
+    series.append([new_bar_ts, last_close, last_close * 1.001, dip_close * 0.999, dip_close, 100.0])
+    ex.candles_by_key[(symbol, tf_key)] = series
+
+    if tf_key != "5m":
+        # must be EXACTLY one bar after the bootstrap cursor's last 5m bar
+        # (not derived independently from new_now's own alignment), or the
+        # cursor-discipline gap check correctly refuses to skip ahead
+        m5_ms = TF_MS["5m"]
+        m5_series = list(ex.candles_by_key[(symbol, "5m")])
+        m5_bar_ts = m5_series[-1][0] + m5_ms
+        m5_series.append([m5_bar_ts, dip_close, dip_close * 1.001, dip_close * 0.999, dip_close, 100.0])
+        ex.candles_by_key[(symbol, "5m")] = m5_series
+
+    # the ticker must track the dip too -- otherwise the entry fills near
+    # the OLD static ticker price (unrelated to the candle that triggered
+    # the signal) while the stop is computed from a candle low far below
+    # it, causing an unrealistic immediate stop-out on the very next cycle
+    ex.tickers[symbol] = {"bid": dip_close * 0.9998, "ask": dip_close * 1.0002}
+    return new_now
+
+
+def _btc_oversold_dip_bar(ex, now, tf_key="15m"):
+    return _fresh_dip_bar(ex, "BTC/USDT", now, tf_key)
+
+
+def test_fresh_system_can_take_its_first_trade_via_exploration(tmp_path):
+    """The core fix: proves a brand-new system (zero live trades anywhere,
+    empty stats_store) CAN open its first paper trade when a strong, fresh
+    raw signal fires -- via the exploration path, since normal scoring
+    alone mathematically cannot (see test_adaptive_meta_controller.py's
+    cold-start-deadlock proof: shrunk_edge is pinned to exactly 0 at n=0)."""
+    now = BASE + 300 * HOUR
+    ex = FakeExchange(now, candles_by_key=_full_candle_set(now))
+    runner = AdaptiveRunner(str(tmp_path), market_data=MarketData(exchange=ex))
+    runner.bootstrap()
+    assert len(runner.portfolio.positions) == 0
+
+    _btc_oversold_dip_bar(ex, now)
+    runner.run_once_cycle()
+
+    assert "BTC/USDT" in runner.portfolio.positions
+    pos = runner.portfolio.positions["BTC/USDT"]
+    assert pos.strategy == "mean_reversion"
+    assert runner.exploration_symbol == "BTC/USDT"
+    # exploration-sized (0.10% of 10k equity = ~$10 risk), not normal (0.50% = ~$50)
+    assert pos.risk_amount_usdt < 20.0
+
+
+def test_weak_raw_signal_still_rejected_for_exploration(tmp_path):
+    now = BASE + 300 * HOUR
+    ex = FakeExchange(now, candles_by_key=_full_candle_set(now))
+    runner = AdaptiveRunner(str(tmp_path), market_data=MarketData(exchange=ex))
+    runner.bootstrap()
+
+    # a tiny dip that doesn't clear mean_reversion's z<=-1.5 entry condition at all
+    new_now = now + M15
+    ex._now_ms = new_now
+    new_bar_ts = now - (now % M15)
+    series = list(ex.candles_by_key[("BTC/USDT", "15m")])
+    last_close = series[-1][4]
+    tiny_dip = last_close * 0.999
+    series.append([new_bar_ts, last_close, last_close * 1.001, tiny_dip * 0.999, tiny_dip, 100.0])
+    ex.candles_by_key[("BTC/USDT", "15m")] = series
+
+    runner.run_once_cycle()
+    assert len(runner.portfolio.positions) == 0
+    assert runner.exploration_symbol is None
+
+
+def test_only_one_exploration_position_at_a_time(tmp_path):
+    now = BASE + 300 * HOUR
+    ex = FakeExchange(now, candles_by_key=_full_candle_set(now))
+    runner = AdaptiveRunner(str(tmp_path), market_data=MarketData(exchange=ex))
+    runner.bootstrap()
+
+    now2 = _btc_oversold_dip_bar(ex, now)
+    runner.run_once_cycle()
+    assert runner.exploration_symbol == "BTC/USDT"
+    assert len(runner.portfolio.positions) == 1
+
+    # a second, equally strong signal on a DIFFERENT symbol must NOT also
+    # open an exploration position while one is already held
+    _fresh_dip_bar(ex, "ETH/USDT", now2, "15m")
+
+    runner.run_once_cycle()
+    assert "ETH/USDT" not in runner.portfolio.positions
+    assert len(runner.portfolio.positions) == 1  # still just the original BTC exploration position
+
+
+def test_historical_bootstrap_bars_cannot_generate_exploration_entries(tmp_path):
+    """The same freshness gate that blocks normal fabricated entries on
+    stale bootstrap history also applies to exploration -- exploration
+    candidates are drawn from the same `candidates` list, built only from
+    bars freshly polled THIS cycle."""
+    now = BASE + 300 * HOUR
+    candles = _full_candle_set(now, price=100.0)
+    # inject an obvious historical oversold dip directly into the BOOTSTRAP
+    # data itself (not a fresh post-bootstrap bar)
+    tf_ms = TF_MS["15m"]
+    series = list(candles[("BTC/USDT", "15m")])
+    last_close = series[-1][4]
+    dip_close = last_close * 0.90
+    series[-1] = [series[-1][0], series[-1][1], series[-1][2], dip_close * 0.999, dip_close, 100.0]
+    candles[("BTC/USDT", "15m")] = series
+
+    ex = FakeExchange(now, candles_by_key=candles)
+    runner = AdaptiveRunner(str(tmp_path), market_data=MarketData(exchange=ex))
+    runner.bootstrap()
+    runner.run_once_cycle()  # no new bars have arrived since bootstrap
+    assert len(runner.portfolio.positions) == 0
+    assert runner.exploration_symbol is None
+
+
+def test_normal_risk_limits_override_exploration(tmp_path):
+    """A real consecutive-loss streak must block exploration exactly like
+    a normal entry -- exploration never bypasses basic risk management.
+    (Manually forcing risk_engine.state directly wouldn't be a valid test:
+    run_once_cycle() recomputes degradation state from live evidence at
+    the START of every cycle, so a hand-set state never survives past the
+    first line of the next cycle -- real evidence is required instead.)"""
+    now = BASE + 300 * HOUR
+    ex = FakeExchange(now, candles_by_key=_full_candle_set(now))
+    runner = AdaptiveRunner(str(tmp_path), market_data=MarketData(exchange=ex))
+    runner.bootstrap()
+    runner.consecutive_losses = 5  # >= CONSECUTIVE_LOSS_BREAKER -- both the
+    # breaker check AND evaluate_degradation() independently see this and HALT
+
+    _btc_oversold_dip_bar(ex, now)
+    runner.run_once_cycle()
+    assert len(runner.portfolio.positions) == 0
+    assert runner.exploration_symbol is None
+    assert runner.risk_engine.state.value == "HALTED"
+
+
+def test_exploration_slot_frees_up_after_position_closes(tmp_path):
+    now = BASE + 300 * HOUR
+    ex = FakeExchange(now, candles_by_key=_full_candle_set(now))
+    runner = AdaptiveRunner(str(tmp_path), market_data=MarketData(exchange=ex))
+    runner.bootstrap()
+    _btc_oversold_dip_bar(ex, now)
+    runner.run_once_cycle()
+    assert runner.exploration_symbol == "BTC/USDT"
+
+    # manually close the exploration position, as a stop-out or exit would
+    rec = runner.portfolio.sell("BTC/USDT", best_bid=90.0, fee_rate=0.001, slippage=0.0002,
+                                 ts_ms=1000, exit_reason="test")
+    runner._on_trade_closed(rec)
+    assert runner.exploration_symbol is None  # slot freed for a future cell
+
+
 def test_dashboard_json_has_required_sections(tmp_path):
     now = BASE + 300 * HOUR
     ex = FakeExchange(now, candles_by_key=_full_candle_set(now))

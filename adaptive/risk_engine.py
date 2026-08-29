@@ -49,6 +49,13 @@ STATE_MIN_CONFIDENCE = {
     DegradationState.HALTED: 1.01,
 }
 
+# Paper-exploration sizing (cold-start-deadlock fix): five times smaller
+# than the normal 0.50% risk_per_trade_pct, and capped to a single
+# concurrent exploration position system-wide -- see
+# size_exploration_entry() and meta_controller.is_exploration_eligible().
+EXPLORATION_RISK_PER_TRADE_PCT = 0.10
+MAX_EXPLORATION_POSITIONS = 1
+
 
 @dataclass
 class RiskLimits:
@@ -80,7 +87,12 @@ class RiskEngine:
     # ── position sizing ──────────────────────────────────────────────
     def size_entry(self, *, equity: float, cash: float, current_portfolio_heat_usdt: float,
                     current_crypto_value_usdt: float, stop_distance_frac: float,
-                    confidence: float) -> SizingResult:
+                    confidence: float, risk_pct_override: Optional[float] = None) -> SizingResult:
+        """risk_pct_override: used only by size_exploration_entry() below to
+        substitute EXPLORATION_RISK_PER_TRADE_PCT for the normal
+        risk_per_trade_pct -- every other check (degradation state,
+        confidence floor, all four caps) is identical for an exploration
+        entry, so this is the only thing that differs."""
         limits = self.limits
         mult = STATE_RISK_MULTIPLIER[self.state]
         if mult <= 0:
@@ -95,7 +107,8 @@ class RiskEngine:
         if equity <= 0:
             return SizingResult(False, 0.0, 0.0, "invalid_equity", "equity must be positive")
 
-        risk_amount = equity * (limits.risk_per_trade_pct / 100.0) * mult
+        risk_pct = risk_pct_override if risk_pct_override is not None else limits.risk_per_trade_pct
+        risk_amount = equity * (risk_pct / 100.0) * mult
         notional_from_risk = risk_amount / stop_distance_frac
 
         caps = {"risk_budget": notional_from_risk}
@@ -117,6 +130,32 @@ class RiskEngine:
             return SizingResult(False, 0.0, 0.0, binding, f"{binding} cap is zero/negative")
         actual_risk = notional * stop_distance_frac
         return SizingResult(True, notional, actual_risk, binding)
+
+    def size_exploration_entry(self, *, equity: float, cash: float, current_portfolio_heat_usdt: float,
+                                current_crypto_value_usdt: float, stop_distance_frac: float,
+                                confidence: float) -> SizingResult:
+        """Tightly-bounded PAPER EXPLORATION sizing (cold-start-deadlock
+        fix -- see meta_controller.is_exploration_eligible() for the
+        eligibility gate this is paired with). Uses
+        EXPLORATION_RISK_PER_TRADE_PCT (0.10% of equity) instead of the
+        normal risk_per_trade_pct (0.50%) -- five times smaller -- but is
+        otherwise identical to size_entry(): same degradation-state gate,
+        same confidence floor, same four caps (cash reserve, symbol
+        allocation, portfolio heat, total exposure). Exploration never
+        bypasses basic risk management; it only accepts a smaller,
+        deliberately-priced position to acquire the FIRST live observation
+        for a (symbol, strategy, regime) cell that empirical-Bayes
+        shrinkage would otherwise keep at exactly zero expected edge
+        forever, since a cell with zero trades can never produce a
+        nonzero shrunk_expectancy for shrinkage to update from."""
+        result = self.size_entry(equity=equity, cash=cash,
+                                  current_portfolio_heat_usdt=current_portfolio_heat_usdt,
+                                  current_crypto_value_usdt=current_crypto_value_usdt,
+                                  stop_distance_frac=stop_distance_frac, confidence=confidence,
+                                  risk_pct_override=EXPLORATION_RISK_PER_TRADE_PCT)
+        if result.approved:
+            result.binding_constraint = "exploration:" + result.binding_constraint
+        return result
 
     # ── portfolio-level breakers (mirror PaperEngine._risk_guard_blocked) ──
     def check_breakers(self, *, equity: float, peak_equity: float, daily_start_equity: float,

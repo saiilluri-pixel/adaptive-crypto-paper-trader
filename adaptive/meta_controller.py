@@ -58,6 +58,27 @@ UNCERTAINTY_PENALTY_COEF = 0.5
 DRAWDOWN_PENALTY_COEF = 0.10
 CORRELATION_PENALTY_COEF = 0.6
 
+# Paper-exploration eligibility (cold-start-deadlock fix): a brand-new
+# (symbol, strategy, regime) cell has shrunk_expectancy pinned to EXACTLY
+# the global prior (0.0 by default) until it has at least one live trade,
+# since (n/(n+k))*raw_mean vanishes at n=0 regardless of raw_mean. That
+# zeroes the score formula's positive multiplicative term while every
+# penalty term stays strictly positive (friction alone is always > 0), so
+# NO signal -- however strong -- can ever clear MIN_QUALITY_SCORE for a
+# cell with zero trades. Confirmed both mathematically and against real
+# production decisions.jsonl history: 6 genuine mean_reversion BUY signals
+# fired live across BTC/ETH/SOL and every one scored exactly the same
+# deterministic floor (shrunk_edge=0 forces the same negative value
+# regardless of which symbol or how strong that specific signal was),
+# never reaching the ranked `selected` list. is_exploration_eligible()
+# below is the escape hatch: a signal strong enough and a cell with truly
+# zero history may take ONE small, tightly-risk-capped position (see
+# risk_engine.size_exploration_entry, EXPLORATION_RISK_PER_TRADE_PCT) to
+# acquire that first live observation -- once n>=1, shrinkage naturally
+# takes over and normal scoring governs every subsequent decision for
+# that cell, including whether to ever trade it again.
+MIN_EXPLORATION_SIGNAL_STRENGTH = 0.5
+
 
 @dataclass
 class Opportunity:
@@ -77,6 +98,7 @@ class Opportunity:
     stop_pct: float
     expected_rr: float
     confidence: float  # 1 - uncertainty; consumed by risk_engine's DEFENSIVE-state confidence gate
+    is_exploration_eligible: bool = False  # cell.n == 0 and signal.strength cleared the exploration floor
 
 
 def robustness_multiplier(cell) -> float:
@@ -128,6 +150,7 @@ def score_opportunity(*, symbol: str, signal, regime: str, stats_store,
 
     score = (shrunk_edge * signal.strength * rfit * robust
              - friction_penalty_pct - unc_pen - dd_pen - corr_pen)
+    exploration_eligible = cell.n == 0 and signal.strength >= MIN_EXPLORATION_SIGNAL_STRENGTH
 
     return Opportunity(symbol=symbol, strategy=signal.strategy, regime=regime,
                         direction=signal.direction, score=score, shrunk_edge=shrunk_edge,
@@ -135,7 +158,7 @@ def score_opportunity(*, symbol: str, signal, regime: str, stats_store,
                         friction_penalty=friction_penalty_pct, uncertainty_penalty=unc_pen,
                         drawdown_penalty=dd_pen, correlation_penalty=corr_pen,
                         stop_pct=signal.stop_pct, expected_rr=signal.expected_rr,
-                        confidence=1.0 - uncertainty)
+                        confidence=1.0 - uncertainty, is_exploration_eligible=exploration_eligible)
 
 
 def rank_and_select(candidates: List[Opportunity],

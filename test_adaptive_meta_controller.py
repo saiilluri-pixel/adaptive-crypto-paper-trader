@@ -169,3 +169,50 @@ def test_correlation_matrix_insufficient_sample_defaults_to_zero():
     returns = {"A": [1, 2, 3], "B": [1, 2, 3]}
     m = rolling_correlation_matrix(returns)
     assert m[("A", "B")] == 0.0
+
+
+# ── cold-start deadlock: exploration eligibility ─────────────────────
+def test_cold_start_deadlock_confirmed_zero_trades_never_clears_threshold():
+    """CAN A BRAND-NEW SYSTEM OPEN ITS FIRST TRADE via normal scoring
+    alone? NO -- proven here with MAXIMUM possible signal strength/regime
+    fit/robustness: shrunk_edge is pinned to exactly the global prior
+    (0.0) at n=0, zeroing the score formula's only positive term, while
+    friction_penalty and uncertainty_penalty stay strictly positive."""
+    store = StatsStore()  # fresh, global_prior_mean=0.0, exactly as runner.py constructs it
+    sig = _signal(strength=1.0, regime_compat=("TREND_UP",))  # best possible raw signal
+    opp = score_opportunity(symbol="BTC/USDT", signal=sig, regime="TREND_UP", stats_store=store,
+                             friction_penalty_pct=0.01, already_selected=[], correlation_matrix={})
+    assert opp.shrunk_edge == 0.0
+    assert opp.score < MIN_QUALITY_SCORE
+    assert opp.score < 0  # not just "below threshold" -- strictly negative
+
+
+def test_exploration_eligible_when_zero_trades_and_strong_signal():
+    from adaptive.meta_controller import MIN_EXPLORATION_SIGNAL_STRENGTH
+    store = StatsStore()
+    sig = _signal(strength=MIN_EXPLORATION_SIGNAL_STRENGTH)
+    opp = score_opportunity(symbol="BTC/USDT", signal=sig, regime="TREND_UP", stats_store=store,
+                             friction_penalty_pct=0.01, already_selected=[], correlation_matrix={})
+    assert opp.is_exploration_eligible is True
+
+
+def test_exploration_not_eligible_for_weak_signal():
+    """Weak raw signal must still be rejected even at n=0 -- exploration
+    is not a blanket bypass, it has its own quality floor."""
+    from adaptive.meta_controller import MIN_EXPLORATION_SIGNAL_STRENGTH
+    store = StatsStore()
+    sig = _signal(strength=MIN_EXPLORATION_SIGNAL_STRENGTH - 0.05)
+    opp = score_opportunity(symbol="BTC/USDT", signal=sig, regime="TREND_UP", stats_store=store,
+                             friction_penalty_pct=0.01, already_selected=[], correlation_matrix={})
+    assert opp.is_exploration_eligible is False
+
+
+def test_exploration_not_eligible_once_a_trade_exists():
+    """Once n>=1 for a cell, shrinkage takes over -- exploration is a
+    zero-trades-only escape hatch, not a permanent alternate path."""
+    store = StatsStore()
+    store.record_trade("BTC/USDT", "trend_momentum", "TREND_UP", 1.0)
+    sig = _signal(strength=1.0)
+    opp = score_opportunity(symbol="BTC/USDT", signal=sig, regime="TREND_UP", stats_store=store,
+                             friction_penalty_pct=0.01, already_selected=[], correlation_matrix={})
+    assert opp.is_exploration_eligible is False
