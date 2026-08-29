@@ -46,6 +46,13 @@ DEFAULT_N_WINDOWS = 4
 DEFAULT_WINDOW_BARS = 300
 DEFAULT_MIN_WARMUP_BARS = 30
 
+DAY_MS = 86_400_000
+DEFAULT_TRAIN_DAYS = 20
+DEFAULT_VAL_DAYS = 7
+DEFAULT_TEST_DAYS = 7
+DEFAULT_TARGET_FOLDS = 4
+MIN_TRADES_TRAIN = 3
+
 
 def simulate_window(strategy_name: str, df: pd.DataFrame, params: dict,
                      fee_rate: float, slippage: float,
@@ -144,4 +151,145 @@ def run_research_cycle(*, historical_data_by_symbol: Dict[str, pd.DataFrame],
                 if promoted:
                     champion_params = challenger_params  # subsequent candidates in this cycle
                     # compare against the newly-promoted champion, not the stale one
+    return results
+
+
+# ── TRAIN -> VALIDATION -> TEST walk-forward (fold windows) ────────────
+def fold_windows(data_start_ms: int, data_end_ms: int, train_days: int = DEFAULT_TRAIN_DAYS,
+                  val_days: int = DEFAULT_VAL_DAYS, test_days: int = DEFAULT_TEST_DAYS,
+                  target_folds: int = DEFAULT_TARGET_FOLDS) -> List[dict]:
+    """Evenly spreads target_folds windows across the FULL
+    [data_start_ms, data_end_ms] range.
+
+    This is the CORRECTED pattern -- see research/stage_walkforward_v3.py's
+    fold_windows() docstring for the full history of the defect this
+    avoids: an earlier version of this exact idea (used for the SOL Shock
+    Continuation walk-forward) stepped forward from data_start by a fixed
+    TEST_DAYS increment and stopped once target_folds folds were produced.
+    With a long history, that silently clustered EVERY fold in the
+    earliest slice of the data whenever step*target_folds << total_range,
+    while being reported as covering the full range. Fixed by spacing
+    `target_folds` windows evenly across the whole available span instead.
+    A regression test (test_adaptive_research_worker.py) asserts the first
+    and last fold's test_end land within one window-span of data_start_ms
+    and data_end_ms respectively -- i.e. the folds actually span the
+    intended period, not just its earliest slice.
+    """
+    span = (train_days + val_days + test_days) * DAY_MS
+    total_range = data_end_ms - data_start_ms
+    if total_range < span:
+        return []
+    max_start = data_end_ms - span
+    if target_folds == 1 or max_start <= data_start_ms:
+        starts = [data_start_ms]
+    else:
+        step = (max_start - data_start_ms) / (target_folds - 1)
+        starts = [int(data_start_ms + i * step) for i in range(target_folds)]
+    folds = []
+    for start in starts:
+        train_start = start
+        train_end = train_start + train_days * DAY_MS
+        val_end = train_end + val_days * DAY_MS
+        test_end = val_end + test_days * DAY_MS
+        folds.append({"train_start": train_start, "train_end": train_end,
+                       "val_end": val_end, "test_end": test_end})
+    return folds
+
+
+def evaluate_challenger_walkforward(strategy_name: str, historical_df: pd.DataFrame,
+                                     champion_params: dict, challenger_params: dict,
+                                     fee_rate: float, slippage: float, folds: List[dict],
+                                     min_trades_train: int = MIN_TRADES_TRAIN
+                                     ) -> Tuple[EvaluationResult, EvaluationResult,
+                                                EvaluationResult, EvaluationResult, int]:
+    """Causal TRAIN -> VALIDATION -> TEST per fold.
+
+    TRAIN is used ONLY for a minimum-trade eligibility filter, applied
+    BEFORE looking at validation or test results -- never for parameter
+    selection (challenger_params already arrived fixed from
+    generate_challenger_candidates(), no inner search happens here).
+
+    VALIDATION windows become the EvaluationResult/WindowResult objects
+    that adaptive/adaptation.py's promotion rules consume -- this is the
+    primary evidence for the promotion decision.
+
+    TEST windows are evaluated and returned separately, purely as a final
+    "not materially negative" sanity check (adaptive spec section 8) --
+    they are NEVER used to choose between champion and challenger, and
+    never feed into the primary promotion score.
+
+    Returns (champion_validation_eval, challenger_validation_eval,
+    champion_test_eval, challenger_test_eval, n_eligible_folds).
+    """
+    champ_val, chal_val, champ_test, chal_test = [], [], [], []
+    eligible = 0
+    ts = historical_df["ts"]
+    for i, fold in enumerate(folds):
+        train_df = historical_df[(ts >= fold["train_start"]) & (ts < fold["train_end"])].reset_index(drop=True)
+        val_df = historical_df[(ts >= fold["train_end"]) & (ts < fold["val_end"])].reset_index(drop=True)
+        test_df = historical_df[(ts >= fold["val_end"]) & (ts < fold["test_end"])].reset_index(drop=True)
+        if len(train_df) == 0 or len(val_df) == 0 or len(test_df) == 0:
+            continue
+        train_trades = simulate_window(strategy_name, train_df, challenger_params, fee_rate, slippage)
+        if len(train_trades) < min_trades_train:
+            continue  # eligibility filter -- BEFORE validation/test are even examined
+        eligible += 1
+        champ_val.append(WindowResult(f"val{i}", simulate_window(
+            strategy_name, val_df, champion_params, fee_rate, slippage)))
+        chal_val.append(WindowResult(f"val{i}", simulate_window(
+            strategy_name, val_df, challenger_params, fee_rate, slippage)))
+        champ_test.append(WindowResult(f"test{i}", simulate_window(
+            strategy_name, test_df, champion_params, fee_rate, slippage)))
+        chal_test.append(WindowResult(f"test{i}", simulate_window(
+            strategy_name, test_df, challenger_params, fee_rate, slippage)))
+
+    return (EvaluationResult(strategy_name, "champion_validation", champion_params, champ_val),
+            EvaluationResult(strategy_name, "challenger_validation", challenger_params, chal_val),
+            EvaluationResult(strategy_name, "champion_test", champion_params, champ_test),
+            EvaluationResult(strategy_name, "challenger_test", challenger_params, chal_test),
+            eligible)
+
+
+def run_research_cycle_walkforward(*, historical_data_by_symbol: Dict[str, pd.DataFrame],
+                                    adaptation_engine: AdaptationEngine, default_params: Dict[str, dict],
+                                    fee_rate: float, slippage: float, now_ts: Optional[float] = None,
+                                    train_days: int = DEFAULT_TRAIN_DAYS, val_days: int = DEFAULT_VAL_DAYS,
+                                    test_days: int = DEFAULT_TEST_DAYS, target_folds: int = DEFAULT_TARGET_FOLDS
+                                    ) -> List[dict]:
+    """The production "full challenger evaluation" cycle (adaptive spec
+    section 3/7/8): causal TRAIN->VALIDATION->TEST via fold_windows(),
+    never the TEST result used to select a challenger. This is what
+    adaptive/research_service.py calls once per full-evaluation cadence --
+    the simpler run_research_cycle() above remains available for quick/
+    lightweight comparisons and existing tests, but is NOT what decides
+    live promotions once this function is wired in."""
+    results = []
+    for strategy_name in STRATEGY_FNS:
+        if strategy_name in NON_ADAPTIVE_STRATEGIES:
+            continue
+        champion_params = adaptation_engine.get_champion_params(
+            strategy_name, default_params.get(strategy_name, {}))
+        for symbol, df in historical_data_by_symbol.items():
+            if len(df) == 0:
+                continue
+            data_start_ms, data_end_ms = int(df["ts"].iloc[0]), int(df["ts"].iloc[-1])
+            folds = fold_windows(data_start_ms, data_end_ms, train_days, val_days, test_days, target_folds)
+            if not folds:
+                continue
+            for challenger_params in generate_challenger_candidates(strategy_name, champion_params):
+                champ_val, chal_val, champ_test, chal_test, n_eligible = evaluate_challenger_walkforward(
+                    strategy_name, df, champion_params, challenger_params, fee_rate, slippage, folds)
+                if n_eligible == 0:
+                    results.append({"strategy": strategy_name, "symbol": symbol,
+                                     "challenger_params": challenger_params, "promoted": False,
+                                     "reason": "no_eligible_folds"})
+                    continue
+                promoted = adaptation_engine.consider_promotion(
+                    strategy_name, champ_val, chal_val, challenger_params, now_ts=now_ts,
+                    challenger_test_eval=chal_test)
+                results.append({"strategy": strategy_name, "symbol": symbol,
+                                 "challenger_params": challenger_params, "promoted": promoted,
+                                 "n_eligible_folds": n_eligible})
+                if promoted:
+                    champion_params = challenger_params
     return results

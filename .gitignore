@@ -31,6 +31,11 @@ shadow/*/diagnostics/*.jsonl
 adaptive_runtime/decisions.jsonl
 adaptive_runtime/adaptation_log.jsonl
 adaptive_runtime/dashboard.json
+adaptive_runtime/champion_state.json
+adaptive_runtime/champion_state.json.tmp
+adaptive_runtime/research_status.json
+adaptive_runtime/research.log
+adaptive_runtime/research_cache/
 
 # Python
 __pycache__/

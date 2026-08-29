@@ -126,6 +126,97 @@ def test_genuinely_new_bar_can_trigger_an_entry(tmp_path):
     assert len(ranking_events) >= 1
 
 
+def test_bootstrap_creates_baseline_champion_when_missing(tmp_path):
+    now = BASE + 300 * HOUR
+    ex = FakeExchange(now, candles_by_key=_full_candle_set(now))
+    runner = AdaptiveRunner(str(tmp_path), market_data=MarketData(exchange=ex))
+    runner.bootstrap()
+    assert "trend_momentum" in runner.champions
+    assert runner.champions["trend_momentum"].version == 1
+    assert runner.champions["trend_momentum"].status == "BASELINE"
+
+
+def test_new_entries_use_latest_champion_params(tmp_path):
+    """A promoted (research-service-written) champion file must be picked
+    up by the execution runner on its next cycle -- proves the read side
+    of the research<->execution contract works end to end."""
+    now = BASE + 300 * HOUR
+    ex = FakeExchange(now, candles_by_key=_full_candle_set(now))
+    runner = AdaptiveRunner(str(tmp_path), market_data=MarketData(exchange=ex))
+    runner.bootstrap()
+
+    from adaptive.champion_store import ChampionStore
+    store = ChampionStore(os.path.join(str(tmp_path), "champion_state.json"))
+    records = store.read()
+    promoted = store.promote("trend_momentum", {"z_threshold": 0.42}, records["trend_momentum"])
+    records["trend_momentum"] = promoted
+    store.write(records)
+
+    runner._refresh_champions()
+    assert runner._get_champion_params("trend_momentum") == {"z_threshold": 0.42}
+    assert runner._champion_version("trend_momentum") == 2
+
+
+def test_corrupted_champion_file_falls_back_to_last_known_good(tmp_path):
+    now = BASE + 300 * HOUR
+    ex = FakeExchange(now, candles_by_key=_full_candle_set(now))
+    runner = AdaptiveRunner(str(tmp_path), market_data=MarketData(exchange=ex))
+    runner.bootstrap()
+    good_params = dict(runner._get_champion_params("trend_momentum"))
+
+    # corrupt the file directly
+    path = os.path.join(str(tmp_path), "champion_state.json")
+    with open(path, "w") as f:
+        f.write("{ not valid json at all")
+
+    runner._refresh_champions()
+    assert runner.champion_load_failed is True
+    assert runner._get_champion_params("trend_momentum") == good_params  # unchanged, not crashed
+
+
+def test_corrupted_champion_file_does_not_crash_a_full_cycle(tmp_path):
+    now = BASE + 300 * HOUR
+    ex = FakeExchange(now, candles_by_key=_full_candle_set(now))
+    runner = AdaptiveRunner(str(tmp_path), market_data=MarketData(exchange=ex))
+    runner.bootstrap()
+    path = os.path.join(str(tmp_path), "champion_state.json")
+    with open(path, "w") as f:
+        f.write("{ not valid json at all")
+    runner.run_once_cycle()  # must not raise
+    assert runner.champion_load_failed is True
+
+
+def test_research_process_cannot_touch_portfolio_position_state(tmp_path):
+    """Structural proof: promoting a new champion via ChampionStore never
+    touches state.json, and an existing open position's entry-time
+    contract (strategy/stop/trail_state) is completely unaffected by it."""
+    now = BASE + 300 * HOUR
+    ex = FakeExchange(now, candles_by_key=_full_candle_set(now))
+    runner = AdaptiveRunner(str(tmp_path), market_data=MarketData(exchange=ex))
+    runner.bootstrap()
+    runner.portfolio.buy("BTC/USDT", best_ask=100.0, notional_usdt=500.0, fee_rate=0.001,
+                          slippage=0.0002, ts_ms=1000, strategy="trend_momentum", regime="TREND_UP",
+                          confidence=0.8, stop_price=95.0, initial_stop_pct=5.0, risk_amount_usdt=25.0)
+    from adaptive.trailing import new_trail_state
+    runner.portfolio.positions["BTC/USDT"].trail_state = new_trail_state(100.0, 5.0)
+    runner._save_state()
+    state_mtime_before = os.path.getmtime(os.path.join(str(tmp_path), "state.json"))
+    original_stop = runner.portfolio.positions["BTC/USDT"].stop_price
+    original_initial_pct = runner.portfolio.positions["BTC/USDT"].initial_stop_pct
+
+    from adaptive.champion_store import ChampionStore
+    store = ChampionStore(os.path.join(str(tmp_path), "champion_state.json"))
+    records = store.read()
+    promoted = store.promote("trend_momentum", {"z_threshold": 0.1}, records["trend_momentum"])
+    records["trend_momentum"] = promoted
+    store.write(records)  # simulates the research service promoting a new champion
+
+    assert os.path.getmtime(os.path.join(str(tmp_path), "state.json")) == state_mtime_before
+    assert runner.portfolio.positions["BTC/USDT"].stop_price == original_stop
+    assert runner.portfolio.positions["BTC/USDT"].initial_stop_pct == original_initial_pct
+    assert runner.portfolio.positions["BTC/USDT"].strategy == "trend_momentum"  # unchanged
+
+
 def test_dashboard_json_has_required_sections(tmp_path):
     now = BASE + 300 * HOUR
     ex = FakeExchange(now, candles_by_key=_full_candle_set(now))

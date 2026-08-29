@@ -42,7 +42,7 @@ from adaptive.strategies import (  # noqa: E402
     TREND_DEFAULT_PARAMS, BREAKOUT_DEFAULT_PARAMS, MEANREV_DEFAULT_PARAMS,
 )
 from adaptive.stats_store import StatsStore  # noqa: E402
-from adaptive.adaptation import AdaptationEngine  # noqa: E402
+from adaptive.champion_store import ChampionStore, ChampionRecord, ChampionCorruptionError  # noqa: E402
 from adaptive.meta_controller import (  # noqa: E402
     score_opportunity, rank_and_select, rolling_correlation_matrix, friction_pct,
 )
@@ -81,7 +81,14 @@ class AdaptiveRunner:
         self.portfolio = Portfolio(START_CAPITAL)
         self.risk_engine = RiskEngine(RiskLimits())
         self.stats_store = StatsStore()
-        self.adaptation = AdaptationEngine(os.path.join(runtime_dir, "adaptation_log.jsonl"))
+        # Champions are READ-ONLY here -- adaptive/research_service.py (a
+        # separate process) is the sole writer of champion_state.json.
+        # self.champions is the last successfully verified copy; a
+        # corrupt/missing file on any given read leaves it unchanged
+        # rather than crashing or trading on unverified parameters.
+        self.champion_store = ChampionStore(os.path.join(runtime_dir, "champion_state.json"))
+        self.champions: Dict[str, ChampionRecord] = {}
+        self.champion_load_failed = False
         self.daily_start_equity = START_CAPITAL
         self.trading_day: Optional[str] = None
         self.consecutive_losses = 0
@@ -189,6 +196,17 @@ class AdaptiveRunner:
         state = self._load_state()
         if state:
             self._restore(state)
+        # Idempotent: creates v1 BASELINE champion records only if the
+        # shared file doesn't exist yet (e.g. this process starts before
+        # adaptive/research_service.py ever has). Never overwrites real
+        # promotion history if the file already exists.
+        try:
+            self.champions = self.champion_store.ensure_baseline(DEFAULT_PARAMS)
+            self.champion_load_failed = False
+        except ChampionCorruptionError as e:
+            self.log(f"!! CHAMPION FILE CORRUPTION at bootstrap: {e} -- starting with no champions "
+                     f"(strategies fall back to documented defaults until this resolves)")
+            self.champion_load_failed = True
         for sym in SYMBOLS:
             for tf in TIMEFRAMES:
                 result = self.md.poll(sym, tf)
@@ -229,7 +247,6 @@ class AdaptiveRunner:
         self.trading_day = state.get("trading_day")
         self.consecutive_losses = state.get("consecutive_losses", 0)
         self.stats_store = StatsStore.from_dict(state.get("stats_store"))
-        self.adaptation = AdaptationEngine.from_dict(state.get("adaptation"), self.adaptation.log_path)
         self.risk_engine.state = DegradationState(state.get("risk_state", "NORMAL"))
 
     def _save_state(self):
@@ -251,7 +268,6 @@ class AdaptiveRunner:
             "consecutive_losses": self.consecutive_losses,
             "reconciliation_failed": sorted(self.reconciliation_failed),
             "stats_store": self.stats_store.to_dict(),
-            "adaptation": self.adaptation.to_dict(),
             "risk_state": self.risk_engine.state.value,
             "market_cursors": {f"{s}|{tf}": ts for (s, tf), ts in self.md.cursors.items()},
         }
@@ -259,6 +275,27 @@ class AdaptiveRunner:
         with open(tmp, "w") as f:
             json.dump(state, f, indent=2, default=str)
         os.replace(tmp, self.state_path)
+
+    # ── champion state: READ-ONLY here, written only by research_service.py ──
+    def _refresh_champions(self):
+        try:
+            self.champions = self.champion_store.read()
+            if self.champion_load_failed:
+                self.log("  champion file recovered -- resuming normal champion reads")
+            self.champion_load_failed = False
+        except ChampionCorruptionError as e:
+            if not self.champion_load_failed:  # log once per failure onset, not every cycle
+                self.log(f"!! CHAMPION FILE CORRUPTION: {e} -- retaining last known-good champions")
+            self.champion_load_failed = True
+            # self.champions intentionally left unchanged -- last verified copy stays in effect
+
+    def _get_champion_params(self, strategy: str) -> dict:
+        rec = self.champions.get(strategy)
+        return rec.parameters if rec is not None else DEFAULT_PARAMS.get(strategy, {})
+
+    def _champion_version(self, strategy: str) -> Optional[int]:
+        rec = self.champions.get(strategy)
+        return rec.version if rec is not None else None
 
     def snapshot(self, prices: Dict[str, float]) -> dict:
         """Section 20 dashboard/status: PORTFOLIO, POSITIONS, AI BRAIN, MARKET."""
@@ -276,11 +313,13 @@ class AdaptiveRunner:
         snap["reconciliation_failed"] = sorted(self.reconciliation_failed)
 
         snap["ai_brain"] = {
-            "champions": self.adaptation.champions,
+            "champions": {s: {"version": r.version, "status": r.status, "hash": r.hash,
+                               "parameters": r.parameters, "created_at_iso": r.created_at_iso}
+                          for s, r in self.champions.items()},
+            "champion_file_load_failed": self.champion_load_failed,
             "strategies_active": list(DEFAULT_PARAMS.keys()) + ["shock_continuation"],
             "risk_state": self.risk_engine.state.value,
             "risk_state_reason": self.risk_engine.state_reason,
-            "last_promotions": self.adaptation.last_promotion_ts,
         }
 
         market = {}
@@ -311,6 +350,7 @@ class AdaptiveRunner:
 
     # ── one decision cycle ───────────────────────────────────────────
     def run_once_cycle(self):
+        self._refresh_champions()
         poll_results = self.md.poll_all()
         # A strategy may only enter on a bar that was FRESHLY polled this
         # cycle -- never on history that was already sitting in
@@ -375,12 +415,11 @@ class AdaptiveRunner:
             fresh_1h = fresh.get((sym, "1h"), False)
             fresh_15m = fresh.get((sym, "15m"), False)
             signals = {
-                "trend_momentum": (trend_momentum(df_1h, self.adaptation.get_champion_params(
-                    "trend_momentum", DEFAULT_PARAMS["trend_momentum"])), fresh_1h),
-                "volatility_breakout": (volatility_breakout(df_15m, self.adaptation.get_champion_params(
-                    "volatility_breakout", DEFAULT_PARAMS["volatility_breakout"])), fresh_15m),
-                "mean_reversion": (mean_reversion(df_15m, self.adaptation.get_champion_params(
-                    "mean_reversion", DEFAULT_PARAMS["mean_reversion"])), fresh_15m),
+                "trend_momentum": (trend_momentum(df_1h, self._get_champion_params("trend_momentum")), fresh_1h),
+                "volatility_breakout": (volatility_breakout(
+                    df_15m, self._get_champion_params("volatility_breakout")), fresh_15m),
+                "mean_reversion": (mean_reversion(
+                    df_15m, self._get_champion_params("mean_reversion")), fresh_15m),
             }
             if fresh_1h:
                 # shock_continuation is STATEFUL (mutates its detector's
@@ -440,8 +479,12 @@ class AdaptiveRunner:
                 pos.trail_state = new_trail_state(pos.entry_price, opp.stop_pct)
                 pos.stop_price = pos.trail_state["sl_price"]
                 self._log_decision(opp.symbol, "entered", {
-                    "strategy": opp.strategy, "regime": opp.regime, "score": opp.score,
-                    "notional": sizing.notional_usdt, "risk": sizing.risk_amount_usdt,
+                    "strategy": opp.strategy, "champion_version": self._champion_version(opp.strategy),
+                    "regime": opp.regime, "confidence": opp.confidence, "score": opp.score,
+                    "shrunk_edge": opp.shrunk_edge, "notional": sizing.notional_usdt,
+                    "risk": sizing.risk_amount_usdt, "portfolio_heat_usdt": sum(
+                        p.risk_amount_usdt for p in self.portfolio.positions.values()),
+                    "risk_state": self.risk_engine.state.value,
                     "correlation_penalty": opp.correlation_penalty, "fees_slippage_est": opp.friction_penalty,
                 })
                 self.log(f"  >>> BUY {opp.symbol} {pos.qty:.6f} @ {pos.entry_price:.4f} "

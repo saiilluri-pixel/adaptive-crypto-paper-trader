@@ -55,6 +55,18 @@ def test_weak_challenger_rejected_lower_profit_factor():
     assert "profit_factor" in reasons
 
 
+def test_challenger_below_absolute_pf_floor_rejected_even_if_above_champion():
+    """PF > 1 after costs is required absolutely, not merely relative to a
+    (possibly also-weak) champion."""
+    champ = _eval("trend_momentum", "champion", {"z_threshold": 1.0},
+                  [[0.05, -0.1] * 20])  # PF = 1/2 = 0.5 -- a weak champion
+    chal = _eval("trend_momentum", "challenger", {"z_threshold": 0.8},
+                 [[0.09, -0.1] * 20])  # PF = 1.8/2 = 0.9 -- better than champion but still < 1.0
+    ok, reasons = evaluate_promotion(champ, chal)
+    assert not ok
+    assert "profit_factor_floor" in reasons
+
+
 def test_stronger_validated_challenger_promoted(tmp_path):
     log = str(tmp_path / "adaptation_log.jsonl")
     eng = AdaptationEngine(log)
@@ -152,6 +164,24 @@ def test_parameter_version_persisted_round_trip(tmp_path):
     restored = AdaptationEngine.from_dict(d, log)
     assert restored.champions == eng.champions
     assert restored.last_promotion_ts == eng.last_promotion_ts
+
+
+def test_promotion_log_is_complete_per_spec_section_11(tmp_path):
+    log = str(tmp_path / "adaptation_log.jsonl")
+    eng = AdaptationEngine(log)
+    champ = _weak_champion()
+    chal = _strong_challenger()
+    test_eval = _eval("trend_momentum", "challenger_test", {"z_threshold": 0.8}, [[0.5] * 10])
+    eng.consider_promotion("trend_momentum", champ, chal, {"z_threshold": 0.8}, now_ts=1000.0,
+                            challenger_test_eval=test_eval)
+    record = json.loads(open(log).readlines()[0])
+    for key in ("ts_iso", "strategy", "action", "reason", "old_params", "new_params",
+                "parameters_changed", "old_hash", "new_hash", "champion_metrics",
+                "challenger_metrics", "challenger_test_metrics"):
+        assert key in record, f"promotion log missing required field: {key}"
+    assert record["challenger_test_metrics"]["n_test_windows"] == 1
+    assert record["champion_metrics"]["n_validation_windows"] == 1
+    assert "z_threshold" in record["parameters_changed"]
 
 
 def test_get_champion_params_falls_back_to_default():

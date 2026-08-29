@@ -109,7 +109,19 @@ def params_hash(params: dict) -> str:
     return hashlib.sha256(json.dumps(params, sort_keys=True).encode()).hexdigest()[:16]
 
 
-def evaluate_promotion(champion: EvaluationResult, challenger: EvaluationResult) -> Tuple[bool, Dict[str, str]]:
+TEST_EXPECTANCY_TOLERANCE_PCT = -0.05  # "not materially negative" -- a small negative
+                                        # allowance for noise, not a license for a losing test result
+ABSOLUTE_MIN_PROFIT_FACTOR = 1.0
+
+
+def evaluate_promotion(champion: EvaluationResult, challenger: EvaluationResult,
+                        challenger_test: Optional[EvaluationResult] = None
+                        ) -> Tuple[bool, Dict[str, str]]:
+    """challenger_test (optional): the TEST-window EvaluationResult from
+    research_worker.evaluate_challenger_walkforward(). Used ONLY for the
+    'not materially negative' sanity check below -- never contributes to
+    sample-size, expectancy, PF, drawdown, or window-consistency scoring,
+    so the primary promotion decision is never made on the test set."""
     reasons: Dict[str, str] = {}
 
     if challenger.n_trades < MIN_PROMOTION_SAMPLE:
@@ -124,6 +136,16 @@ def evaluate_promotion(champion: EvaluationResult, challenger: EvaluationResult)
     chal_pf_val = chal_pf if chal_pf is not None else 0.0
     if chal_pf_val <= champ_pf_val:
         reasons["profit_factor"] = f"challenger PF {chal_pf_val:.3f} <= champion PF {champ_pf_val:.3f}"
+    if chal_pf_val <= ABSOLUTE_MIN_PROFIT_FACTOR:
+        reasons["profit_factor_floor"] = f"challenger PF {chal_pf_val:.3f} <= absolute floor {ABSOLUTE_MIN_PROFIT_FACTOR}"
+
+    if challenger_test is not None:
+        if challenger_test.n_trades == 0:
+            reasons["test_expectancy"] = "no test-window trades to evaluate"
+        elif challenger_test.expectancy_pct < TEST_EXPECTANCY_TOLERANCE_PCT:
+            reasons["test_expectancy"] = (f"held-out test expectancy {challenger_test.expectancy_pct:.4f}% "
+                                           f"< tolerance {TEST_EXPECTANCY_TOLERANCE_PCT}% -- not used to "
+                                           f"SELECT the challenger, only to veto an otherwise-passing one")
 
     if champion.max_dd_pct > 0 and challenger.max_dd_pct > champion.max_dd_pct * DD_TOLERANCE:
         reasons["drawdown"] = (f"challenger max DD {challenger.max_dd_pct:.3f}% > "
@@ -162,7 +184,8 @@ class AdaptationEngine:
     def consider_promotion(self, strategy: str, champion_eval: EvaluationResult,
                             challenger_eval: EvaluationResult, challenger_params: dict,
                             now_ts: Optional[float] = None,
-                            min_interval: float = MIN_PROMOTION_INTERVAL_SEC) -> bool:
+                            min_interval: float = MIN_PROMOTION_INTERVAL_SEC,
+                            challenger_test_eval: Optional[EvaluationResult] = None) -> bool:
         if strategy in NON_ADAPTIVE_STRATEGIES:
             self._log(strategy, "rejected", {"reasons": {"frozen_strategy": "not eligible for adaptation"}})
             return False
@@ -175,7 +198,7 @@ class AdaptationEngine:
                        {"reasons": {"min_interval": f"{now_ts - last:.0f}s < {min_interval:.0f}s"}})
             return False
 
-        ok, reasons = evaluate_promotion(champion_eval, challenger_eval)
+        ok, reasons = evaluate_promotion(champion_eval, challenger_eval, challenger_test_eval)
         if not ok:
             self._log(strategy, "rejected", {"reasons": reasons,
                                                "challenger_hash": params_hash(challenger_params)})
@@ -185,18 +208,34 @@ class AdaptationEngine:
         self.champion_history.setdefault(strategy, []).append(old)
         self.champions[strategy] = challenger_params
         self.last_promotion_ts[strategy] = now_ts
+        old_version = self.champion_history.get(strategy, [])
+        parameters_changed = {
+            k: {"old": old.get(k) if old else None, "new": v}
+            for k, v in challenger_params.items() if not old or old.get(k) != v
+        }
         self._log(strategy, "promoted", {
+            "reason": "challenger cleared all promotion criteria (sample, expectancy, PF, "
+                      "drawdown, window-consistency, outlier-independence" +
+                      (", test-set sanity check" if challenger_test_eval is not None else "") + ")",
             "old_params": old, "new_params": challenger_params,
+            "parameters_changed": parameters_changed,
             "old_hash": params_hash(old) if old else None,
             "new_hash": params_hash(challenger_params),
+            "n_promotions_so_far": len(old_version) + 1,
             "champion_metrics": {"n_trades": champion_eval.n_trades,
                                   "expectancy_pct": champion_eval.expectancy_pct,
                                   "profit_factor": champion_eval.profit_factor,
-                                  "max_dd_pct": champion_eval.max_dd_pct},
+                                  "max_dd_pct": champion_eval.max_dd_pct,
+                                  "n_validation_windows": len(champion_eval.windows)},
             "challenger_metrics": {"n_trades": challenger_eval.n_trades,
                                     "expectancy_pct": challenger_eval.expectancy_pct,
                                     "profit_factor": challenger_eval.profit_factor,
-                                    "max_dd_pct": challenger_eval.max_dd_pct},
+                                    "max_dd_pct": challenger_eval.max_dd_pct,
+                                    "n_validation_windows": len(challenger_eval.windows)},
+            "challenger_test_metrics": ({"n_trades": challenger_test_eval.n_trades,
+                                          "expectancy_pct": challenger_test_eval.expectancy_pct,
+                                          "n_test_windows": len(challenger_test_eval.windows)}
+                                         if challenger_test_eval is not None else None),
         })
         return True
 
