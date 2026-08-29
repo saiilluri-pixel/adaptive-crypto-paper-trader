@@ -26,6 +26,12 @@ shadow/*/config_snapshot.json
 shadow/*/*.tmp
 shadow/*/diagnostics/*.jsonl
 
+# Adaptive Spot paper trader runtime (regenerated; never source-of-truth --
+# state.json/paper.log/trades*.csv already covered above)
+adaptive_runtime/decisions.jsonl
+adaptive_runtime/adaptation_log.jsonl
+adaptive_runtime/dashboard.json
+
 # Python
 __pycache__/
 *.pyc
