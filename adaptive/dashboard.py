@@ -60,6 +60,17 @@ def _read_jsonl_tail(path, n=40):
     return out[::-1]
 
 
+def _read_text_tail(path, n=40):
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path) as f:
+            lines = f.readlines()
+    except Exception:
+        return []
+    return [l.rstrip("\n") for l in lines[-n:]][::-1]
+
+
 def _read_csv_tail(path, n=25):
     if not os.path.exists(path):
         return []
@@ -115,6 +126,8 @@ def build_api():
     decisions = _read_jsonl_tail(os.path.join(RUNTIME_DIR, "decisions.jsonl"), 40)
     adaptation_log = _read_jsonl_tail(os.path.join(RUNTIME_DIR, "adaptation_log.jsonl"), 40)
     trades = _read_csv_tail(os.path.join(RUNTIME_DIR, "trades.csv"), 25)
+    paper_log = _read_text_tail(os.path.join(RUNTIME_DIR, "paper.log"), 40)
+    research_log = _read_text_tail(os.path.join(RUNTIME_DIR, "research.log"), 40)
 
     adaptive_status, adaptive_pid = _service_status(SERVICE_LABELS["adaptive"])
     research_status_svc, research_pid = _service_status(SERVICE_LABELS["research"])
@@ -140,11 +153,13 @@ def build_api():
         "desired_positions": desired_positions,
         "adaptation_log": adaptation_log,
         "trades": trades,
+        "paper_log": paper_log,
+        "research_log": research_log,
         "risk_limits": _risk_limits(),
         "data_sources": [
             "adaptive_runtime/dashboard.json", "adaptive_runtime/research_status.json",
             "adaptive_runtime/decisions.jsonl", "adaptive_runtime/adaptation_log.jsonl",
-            "adaptive_runtime/trades.csv",
+            "adaptive_runtime/trades.csv", "adaptive_runtime/paper.log", "adaptive_runtime/research.log",
         ],
     }
 
@@ -192,6 +207,14 @@ tr:hover td { background:#0f151f; }
 .badge.rejected { background:#20232a; color:var(--dim); }
 .badge.rollback { background:#2a1215; color:var(--red); }
 .muted { color:var(--dim); font-style:italic; }
+.logbox { background:#080b0f; border:1px solid var(--border); border-radius:8px; padding:10px 12px;
+          max-height:260px; overflow-y:auto; font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+          font-size:11.5px; line-height:1.6; white-space:pre-wrap; word-break:break-all; }
+.logbox .err { color:var(--red); }
+.logbox .warn { color:var(--yellow); }
+.tabs { display:flex; gap:6px; margin-bottom:8px; }
+.tab { padding:4px 12px; border-radius:6px; font-size:12px; cursor:pointer; border:1px solid var(--border); color:var(--dim); }
+.tab.active { background:#1a2230; color:var(--blue); border-color:#2a3a55; }
 .mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; }
 .subgrid { display:grid; grid-template-columns:1fr 1fr; gap:4px 12px; margin-top:8px; }
 .subgrid .k { color:var(--dim); font-size:12px; } .subgrid .v { font-size:12px; text-align:right; }
@@ -211,6 +234,16 @@ tr:hover td { background:#0f151f; }
     <div class="muted" id="genat">loading…</div>
   </div>
   <div id="svc-pills"></div>
+</div>
+
+<h2>System Log <span class="muted" style="text-transform:none; letter-spacing:0;">— raw process output, proof the bot is alive between trades</span></h2>
+<div class="card">
+  <div class="tabs">
+    <div class="tab active" data-logtab="paper" onclick="showLogTab('paper')">Execution (paper.log)</div>
+    <div class="tab" data-logtab="research" onclick="showLogTab('research')">Research (research.log)</div>
+  </div>
+  <div id="paper-log" class="logbox"></div>
+  <div id="research-log" class="logbox" style="display:none;"></div>
 </div>
 
 <h2>Portfolio</h2>
@@ -257,6 +290,21 @@ function pill(status, pid){
   return `<span class="pill ${cls}">${status}${pid?(' · pid '+pid):''}</span>`;
 }
 
+function renderLog(elId, lines){
+  const el = document.getElementById(elId);
+  if(!lines || lines.length===0){ el.innerHTML = '<span class="muted">no log lines yet</span>'; return; }
+  el.innerHTML = lines.map(l=>{
+    const c = /error|exception/i.test(l) ? 'err' : (/!!|warn/i.test(l) ? 'warn' : '');
+    return `<div class="${c}">${esc(l)}</div>`;
+  }).join('');
+}
+
+function showLogTab(which){
+  document.querySelectorAll('[data-logtab]').forEach(t=>t.classList.toggle('active', t.dataset.logtab===which));
+  document.getElementById('paper-log').style.display = which==='paper' ? 'block' : 'none';
+  document.getElementById('research-log').style.display = which==='research' ? 'block' : 'none';
+}
+
 async function refresh(){
   let d;
   try { d = await (await fetch('/api/state')).json(); } catch(e) { return; }
@@ -265,6 +313,9 @@ async function refresh(){
   document.getElementById('svc-pills').innerHTML =
     'adaptive ' + pill(d.services.adaptive.status, d.services.adaptive.pid) + '&nbsp;&nbsp;' +
     'research ' + pill(d.services.research.status, d.services.research.pid);
+
+  renderLog('paper-log', d.paper_log);
+  renderLog('research-log', d.research_log);
 
   const p = d.portfolio || {};
   document.getElementById('portfolio-cards').innerHTML = `
@@ -390,9 +441,13 @@ async function refresh(){
         <td>$${fmt((parseFloat(t.entry_fee)||0)+(parseFloat(t.exit_fee)||0))}</td><td>${esc(t.exit_reason)}</td></tr>`).join('') + '</tbody></table>';
 
   const decisions = (d.decisions||[]).filter(x=>x.action!=='cycle_ranking').slice(0,25);
+  const heartbeat = d.last_ranking ? `<div class="muted" style="margin-bottom:10px;">Most recent cycle: ${esc(d.last_ranking.ts_iso)}
+    (${ago(d.last_ranking.ts_iso)}) — ${(d.last_ranking.candidates||[]).length} candidate(s), risk_state=${esc(d.last_ranking.risk_state)}.
+    The bot is running and polling every ~30s; nothing else is shown here because no strategy has fired an actionable
+    signal, or blocked/entered a trade, since the events below.</div>` : '';
   document.getElementById('decisions').innerHTML = decisions.length===0
-    ? '<div class="flatnote">No recent per-symbol decisions (only cycle-ranking snapshots so far)</div>'
-    : `<table><thead><tr><th>Time</th><th>Symbol</th><th>Action</th><th>Detail</th></tr></thead><tbody>` +
+    ? heartbeat + '<div class="flatnote">No per-symbol decisions yet (entries, rejections, exits) — only routine cycle-ranking snapshots so far, which are intentionally not listed row-by-row here since there are hundreds of them and each one just confirms "still scanning, nothing qualified."</div>'
+    : heartbeat + `<table><thead><tr><th>Time</th><th>Symbol</th><th>Action</th><th>Detail</th></tr></thead><tbody>` +
       decisions.map(x=>`<tr><td>${esc(x.ts_iso)}</td><td>${esc(x.symbol)}</td><td>${esc(x.action)}</td>
         <td class="mono">${esc(JSON.stringify(Object.fromEntries(Object.entries(x).filter(([k])=>!['ts_iso','symbol','action'].includes(k)))))}</td></tr>`).join('') + '</tbody></table>';
 
