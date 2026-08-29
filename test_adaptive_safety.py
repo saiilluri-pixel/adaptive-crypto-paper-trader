@@ -48,10 +48,21 @@ def test_no_authenticated_order_code_path_in_adaptive_module():
             assert token not in code, f"{path} contains banned authenticated-order token {token!r} in live code"
 
 
+MARGIN_TRADING_TOKENS = ("marginmode", "margin_mode", "isolated_margin", "cross_margin",
+                          "add_margin", "reduce_margin", "setmargin", "setleverage", "leverage=")
+
+
 def test_no_margin_or_futures_code_path_in_adaptive_module():
+    # bare "margin" is deliberately NOT checked here -- adaptive/dashboard.py
+    # embeds a CSS stylesheet as a Python string constant, and the CSS
+    # `margin:`/`margin-top:` properties are legitimate styling, not a
+    # margin-TRADING code path. Precise ccxt/margin-trading identifiers
+    # below are what actually indicate a reachable margin order route.
     for path in _adaptive_py_files():
         code = _source_without_docstrings_and_comments(path)
-        assert "margin" not in code.lower(), f"{path} references margin trading in live code"
+        code_lower = code.lower()
+        for token in MARGIN_TRADING_TOKENS:
+            assert token not in code_lower, f"{path} references margin-trading token {token!r} in live code"
         assert "defaultType" not in code, f"{path} sets a ccxt defaultType override (spot-only expected)"
 
 
