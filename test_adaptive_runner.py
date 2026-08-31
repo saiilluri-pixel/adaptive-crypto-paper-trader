@@ -228,21 +228,35 @@ def _fresh_dip_bar(ex, symbol, now, tf_key="15m"):
     tf_ms = TF_MS[tf_key]
     new_now = now + tf_ms
     ex._now_ms = new_now
-    new_bar_ts = now - (now % tf_ms)
+    # derive the new bar's ts from THIS SYMBOL's own last existing bar on
+    # this timeframe (never independently from `now`'s own alignment) --
+    # otherwise a symbol whose series wasn't touched on a PRIOR call (e.g.
+    # a second call advancing the shared clock again for a DIFFERENT
+    # symbol first) gets a bar placed with a gap before it, which
+    # cursor-discipline silently drops (worse: 15m/1h/4h gaps aren't even
+    # logged today, only 5m ones are -- see the "verify bar processing"
+    # follow-up this bug points at).
     series = list(ex.candles_by_key[(symbol, tf_key)])
     last_close = series[-1][4]
     dip_close = last_close * 0.90
+    new_bar_ts = series[-1][0] + tf_ms
     series.append([new_bar_ts, last_close, last_close * 1.001, dip_close * 0.999, dip_close, 100.0])
     ex.candles_by_key[(symbol, tf_key)] = series
 
     if tf_key != "5m":
-        # must be EXACTLY one bar after the bootstrap cursor's last 5m bar
-        # (not derived independently from new_now's own alignment), or the
-        # cursor-discipline gap check correctly refuses to skip ahead
+        # fill EVERY missing 5m bar up through new_now (not just one) --
+        # if this symbol's 5m series was last touched further in the past
+        # than one bar-width (e.g. a second call advancing the clock again
+        # for a DIFFERENT symbol), a single appended bar would still leave
+        # it stale relative to the new ex._now_ms. Each appended bar is
+        # exactly one bar-width after the previous, so cursor-discipline
+        # never sees a gap.
         m5_ms = TF_MS["5m"]
         m5_series = list(ex.candles_by_key[(symbol, "5m")])
-        m5_bar_ts = m5_series[-1][0] + m5_ms
-        m5_series.append([m5_bar_ts, dip_close, dip_close * 1.001, dip_close * 0.999, dip_close, 100.0])
+        next_ts = m5_series[-1][0] + m5_ms
+        while next_ts + m5_ms <= new_now:
+            m5_series.append([next_ts, dip_close, dip_close * 1.001, dip_close * 0.999, dip_close, 100.0])
+            next_ts += m5_ms
         ex.candles_by_key[(symbol, "5m")] = m5_series
 
     # the ticker must track the dip too -- otherwise the entry fills near
@@ -275,7 +289,7 @@ def test_fresh_system_can_take_its_first_trade_via_exploration(tmp_path):
     assert "BTC/USDT" in runner.portfolio.positions
     pos = runner.portfolio.positions["BTC/USDT"]
     assert pos.strategy == "mean_reversion"
-    assert runner.exploration_symbol == "BTC/USDT"
+    assert runner.exploration_symbols == {"BTC/USDT"}
     # exploration-sized (0.10% of 10k equity = ~$10 risk), not normal (0.50% = ~$50)
     assert pos.risk_amount_usdt < 20.0
 
@@ -298,10 +312,44 @@ def test_weak_raw_signal_still_rejected_for_exploration(tmp_path):
 
     runner.run_once_cycle()
     assert len(runner.portfolio.positions) == 0
-    assert runner.exploration_symbol is None
+    assert runner.exploration_symbols == set()
 
 
-def test_only_one_exploration_position_at_a_time(tmp_path):
+def test_multiple_exploration_positions_can_be_held_simultaneously(tmp_path):
+    """Up to MAX_EXPLORATION_POSITIONS (one per symbol) may explore in
+    parallel -- BTC/ETH/SOL each independently acquiring their first live
+    observation, not serialized behind a single system-wide slot."""
+    now = BASE + 300 * HOUR
+    ex = FakeExchange(now, candles_by_key=_full_candle_set(now))
+    runner = AdaptiveRunner(str(tmp_path), market_data=MarketData(exchange=ex))
+    runner.bootstrap()
+
+    # inject a strong, fresh oversold dip on ALL THREE symbols in the same cycle
+    for sym in ("BTC/USDT", "ETH/USDT", "SOL/USDT"):
+        _fresh_dip_bar(ex, sym, now, "15m")
+    runner.run_once_cycle()
+
+    assert runner.exploration_symbols == {"BTC/USDT", "ETH/USDT", "SOL/USDT"}
+    assert len(runner.portfolio.positions) == 3
+
+
+def test_exploration_capped_at_max_exploration_positions(tmp_path):
+    """A 4th symbol's signal (if there were one) or a 3-symbol universe
+    already at its cap must not exceed MAX_EXPLORATION_POSITIONS -- proven
+    here via the natural 3-symbol ceiling matching the configured cap."""
+    from adaptive.risk_engine import MAX_EXPLORATION_POSITIONS
+    assert MAX_EXPLORATION_POSITIONS == 3
+    now = BASE + 300 * HOUR
+    ex = FakeExchange(now, candles_by_key=_full_candle_set(now))
+    runner = AdaptiveRunner(str(tmp_path), market_data=MarketData(exchange=ex))
+    runner.bootstrap()
+    for sym in ("BTC/USDT", "ETH/USDT", "SOL/USDT"):
+        _fresh_dip_bar(ex, sym, now, "15m")
+    runner.run_once_cycle()
+    assert len(runner.exploration_symbols) == MAX_EXPLORATION_POSITIONS
+
+
+def test_second_symbol_can_join_exploration_while_first_still_open(tmp_path):
     now = BASE + 300 * HOUR
     ex = FakeExchange(now, candles_by_key=_full_candle_set(now))
     runner = AdaptiveRunner(str(tmp_path), market_data=MarketData(exchange=ex))
@@ -309,16 +357,17 @@ def test_only_one_exploration_position_at_a_time(tmp_path):
 
     now2 = _btc_oversold_dip_bar(ex, now)
     runner.run_once_cycle()
-    assert runner.exploration_symbol == "BTC/USDT"
+    assert runner.exploration_symbols == {"BTC/USDT"}
     assert len(runner.portfolio.positions) == 1
 
-    # a second, equally strong signal on a DIFFERENT symbol must NOT also
-    # open an exploration position while one is already held
+    # a second, equally strong signal on a DIFFERENT symbol -- must now
+    # join exploration alongside BTC (multi-slot behavior), not be blocked
     _fresh_dip_bar(ex, "ETH/USDT", now2, "15m")
-
     runner.run_once_cycle()
-    assert "ETH/USDT" not in runner.portfolio.positions
-    assert len(runner.portfolio.positions) == 1  # still just the original BTC exploration position
+
+    assert "ETH/USDT" in runner.portfolio.positions
+    assert runner.exploration_symbols == {"BTC/USDT", "ETH/USDT"}
+    assert len(runner.portfolio.positions) == 2
 
 
 def test_historical_bootstrap_bars_cannot_generate_exploration_entries(tmp_path):
@@ -342,7 +391,7 @@ def test_historical_bootstrap_bars_cannot_generate_exploration_entries(tmp_path)
     runner.bootstrap()
     runner.run_once_cycle()  # no new bars have arrived since bootstrap
     assert len(runner.portfolio.positions) == 0
-    assert runner.exploration_symbol is None
+    assert runner.exploration_symbols == set()
 
 
 def test_normal_risk_limits_override_exploration(tmp_path):
@@ -362,7 +411,7 @@ def test_normal_risk_limits_override_exploration(tmp_path):
     _btc_oversold_dip_bar(ex, now)
     runner.run_once_cycle()
     assert len(runner.portfolio.positions) == 0
-    assert runner.exploration_symbol is None
+    assert runner.exploration_symbols == set()
     assert runner.risk_engine.state.value == "HALTED"
 
 
@@ -373,13 +422,47 @@ def test_exploration_slot_frees_up_after_position_closes(tmp_path):
     runner.bootstrap()
     _btc_oversold_dip_bar(ex, now)
     runner.run_once_cycle()
-    assert runner.exploration_symbol == "BTC/USDT"
+    assert runner.exploration_symbols == {"BTC/USDT"}
 
     # manually close the exploration position, as a stop-out or exit would
     rec = runner.portfolio.sell("BTC/USDT", best_bid=90.0, fee_rate=0.001, slippage=0.0002,
                                  ts_ms=1000, exit_reason="test")
     runner._on_trade_closed(rec)
-    assert runner.exploration_symbol is None  # slot freed for a future cell
+    assert runner.exploration_symbols == set()  # slot freed for a future cell
+
+
+def test_exploration_symbols_persist_across_restart(tmp_path):
+    now = BASE + 300 * HOUR
+    ex = FakeExchange(now, candles_by_key=_full_candle_set(now))
+    runner1 = AdaptiveRunner(str(tmp_path), market_data=MarketData(exchange=ex))
+    runner1.bootstrap()
+    _btc_oversold_dip_bar(ex, now)
+    runner1.run_once_cycle()
+    assert runner1.exploration_symbols == {"BTC/USDT"}
+
+    runner2 = AdaptiveRunner(str(tmp_path), market_data=MarketData(exchange=ex))
+    runner2.bootstrap()
+    assert runner2.exploration_symbols == {"BTC/USDT"}
+
+
+def test_legacy_single_exploration_symbol_state_migrates_cleanly(tmp_path):
+    """An older state.json (pre-multi-slot) stored a single
+    "exploration_symbol" string -- must still load correctly."""
+    import json
+    now = BASE + 300 * HOUR
+    ex = FakeExchange(now, candles_by_key=_full_candle_set(now))
+    runner = AdaptiveRunner(str(tmp_path), market_data=MarketData(exchange=ex))
+    runner.bootstrap()
+    with open(runner.state_path) as f:
+        state = json.load(f)
+    del state["exploration_symbols"]
+    state["exploration_symbol"] = "SOL/USDT"  # legacy singular key
+    with open(runner.state_path, "w") as f:
+        json.dump(state, f)
+
+    runner2 = AdaptiveRunner(str(tmp_path), market_data=MarketData(exchange=ex))
+    runner2.bootstrap()
+    assert runner2.exploration_symbols == {"SOL/USDT"}
 
 
 def test_dashboard_json_has_required_sections(tmp_path):

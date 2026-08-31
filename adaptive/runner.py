@@ -35,7 +35,7 @@ sys.path.insert(0, ROOT)
 
 from adaptive.market_data import MarketData, SYMBOLS, TIMEFRAMES, TF_MS  # noqa: E402
 from adaptive.portfolio import Portfolio  # noqa: E402
-from adaptive.risk_engine import RiskEngine, RiskLimits, DegradationState  # noqa: E402
+from adaptive.risk_engine import RiskEngine, RiskLimits, DegradationState, MAX_EXPLORATION_POSITIONS  # noqa: E402
 from adaptive.regime import classify_from_df  # noqa: E402
 from adaptive.strategies import (  # noqa: E402
     trend_momentum, volatility_breakout, mean_reversion, shock_continuation,
@@ -93,10 +93,13 @@ class AdaptiveRunner:
         self.trading_day: Optional[str] = None
         self.consecutive_losses = 0
         self.reconciliation_failed = set()
-        # Paper-exploration slot (cold-start-deadlock fix): at most one
-        # exploration-sized position system-wide at a time, tracked by
-        # symbol so it survives a restart via state.json.
-        self.exploration_symbol: Optional[str] = None
+        # Paper-exploration slots (cold-start-deadlock fix): up to
+        # risk_engine.MAX_EXPLORATION_POSITIONS exploration-sized positions
+        # system-wide at once (one per symbol, matching MAX_POSITIONS below --
+        # never two in the same symbol, since Portfolio.buy() already
+        # forbids that), tracked by symbol so it survives a restart via
+        # state.json.
+        self.exploration_symbols: set = set()
         self.state_path = os.path.join(runtime_dir, "state.json")
         self.trades_csv_path = os.path.join(runtime_dir, "trades.csv")
         self.decisions_path = os.path.join(runtime_dir, "decisions.jsonl")
@@ -190,12 +193,52 @@ class AdaptiveRunner:
         pnl_pct = (rec["net_pnl"] / (rec["qty"] * rec["entry_price"])) * 100 if rec["qty"] * rec["entry_price"] else 0.0
         self.stats_store.record_trade(rec["symbol"], rec["strategy"], rec["regime"], pnl_pct)
         self.consecutive_losses = 0 if rec["net_pnl"] > 0 else self.consecutive_losses + 1
-        if self.exploration_symbol == rec["symbol"]:
-            self.exploration_symbol = None  # frees the single exploration slot for a future cell
+        self.exploration_symbols.discard(rec["symbol"])  # frees this exploration slot for a future cell
         self._write_trade_csv(rec)
         self._log_decision(rec["symbol"], "exited", rec)
         self.log(f"  <<< SELL {rec['symbol']} @ {rec['exit_price']:.4f} ({rec['exit_reason']}) "
                  f"net={rec['net_pnl']:+.2f}")
+
+    def _enter_exploration(self, opp, equity: float, prices: Dict[str, float]):
+        """Attempts one exploration entry for `opp`. Caller (run_once_cycle)
+        is responsible for the eligibility filter, the MAX_EXPLORATION_POSITIONS
+        cap, and iteration order -- this method just executes a single
+        candidate and logs the outcome either way."""
+        sizing = self.risk_engine.size_exploration_entry(
+            equity=equity, cash=self.portfolio.cash,
+            current_portfolio_heat_usdt=sum(p.risk_amount_usdt for p in self.portfolio.positions.values()),
+            current_crypto_value_usdt=self.portfolio.crypto_value(prices),
+            stop_distance_frac=opp.stop_pct / 100.0, confidence=opp.confidence)
+        if not sizing.approved:
+            self._log_decision(opp.symbol, "rejected_exploration_sizing",
+                                {"reason": sizing.reason, "binding": sizing.binding_constraint})
+            return
+        try:
+            _, ask = self.md.best_bid_ask(opp.symbol)
+        except Exception as e:
+            self._log_decision(opp.symbol, "rejected_exploration_price_fetch_failed", {"error": str(e)})
+            return
+        pos = self.portfolio.buy(
+            opp.symbol, best_ask=ask, notional_usdt=sizing.notional_usdt,
+            fee_rate=FEE_RATE, slippage=SLIPPAGE, ts_ms=now_ms(),
+            strategy=opp.strategy, regime=opp.regime, confidence=opp.confidence,
+            stop_price=ask * (1 - opp.stop_pct / 100.0), initial_stop_pct=opp.stop_pct,
+            risk_amount_usdt=sizing.risk_amount_usdt)
+        pos.trail_state = new_trail_state(pos.entry_price, opp.stop_pct)
+        pos.stop_price = pos.trail_state["sl_price"]
+        self.exploration_symbols.add(opp.symbol)
+        self._log_decision(opp.symbol, "entered_exploration", {
+            "strategy": opp.strategy, "champion_version": self._champion_version(opp.strategy),
+            "regime": opp.regime, "confidence": opp.confidence,
+            "signal_strength": opp.signal_strength, "score": opp.score,
+            "notional": sizing.notional_usdt, "risk": sizing.risk_amount_usdt,
+            "risk_state": self.risk_engine.state.value,
+            "concurrent_exploration_positions": len(self.exploration_symbols),
+        })
+        self.log(f"  >>> BUY (EXPLORATION) {opp.symbol} {pos.qty:.6f} @ {pos.entry_price:.4f} "
+                 f"({opp.strategy}/{opp.regime}) risk={sizing.risk_amount_usdt:.2f} -- first live "
+                 f"observation for this (symbol,strategy,regime) cell "
+                 f"[{len(self.exploration_symbols)}/{MAX_EXPLORATION_POSITIONS} exploration slots used]")
 
     # ── bootstrap / restart ─────────────────────────────────────────
     def bootstrap(self):
@@ -252,7 +295,13 @@ class AdaptiveRunner:
         self.daily_start_equity = state.get("daily_start_equity", self.portfolio.cash)
         self.trading_day = state.get("trading_day")
         self.consecutive_losses = state.get("consecutive_losses", 0)
-        self.exploration_symbol = state.get("exploration_symbol")
+        # migration: older state.json files (before multi-slot exploration)
+        # stored a single "exploration_symbol" string/null instead of a list
+        if "exploration_symbols" in state:
+            self.exploration_symbols = set(state.get("exploration_symbols") or [])
+        else:
+            legacy = state.get("exploration_symbol")
+            self.exploration_symbols = {legacy} if legacy else set()
         self.stats_store = StatsStore.from_dict(state.get("stats_store"))
         self.risk_engine.state = DegradationState(state.get("risk_state", "NORMAL"))
 
@@ -273,7 +322,7 @@ class AdaptiveRunner:
             },
             "daily_start_equity": self.daily_start_equity, "trading_day": self.trading_day,
             "consecutive_losses": self.consecutive_losses,
-            "exploration_symbol": self.exploration_symbol,
+            "exploration_symbols": sorted(self.exploration_symbols),
             "reconciliation_failed": sorted(self.reconciliation_failed),
             "stats_store": self.stats_store.to_dict(),
             "risk_state": self.risk_engine.state.value,
@@ -500,62 +549,31 @@ class AdaptiveRunner:
 
             # Paper exploration (cold-start-deadlock fix, see
             # meta_controller.MIN_EXPLORATION_SIGNAL_STRENGTH and
-            # risk_engine.EXPLORATION_RISK_PER_TRADE_PCT): a single,
-            # tightly risk-capped position for a (symbol, strategy, regime)
-            # cell with zero live trades ever, so empirical-Bayes shrinkage
-            # has a first real observation to update from. Normal scoring
-            # can never produce a positive score for such a cell (shrunk_edge
+            # risk_engine.EXPLORATION_RISK_PER_TRADE_PCT): tightly
+            # risk-capped positions for (symbol, strategy, regime) cells
+            # with zero live trades ever, so empirical-Bayes shrinkage has
+            # a first real observation to update from. Normal scoring can
+            # never produce a positive score for such a cell (shrunk_edge
             # is pinned to exactly the global prior at n=0 regardless of raw
             # signal strength), which would otherwise block it forever --
             # confirmed against real production history where 6 genuine
             # mean_reversion BUY signals across BTC/ETH/SOL all scored
             # identically below MIN_QUALITY_SCORE. Gated by the SAME
             # breaker_reason check as normal entries (never bypasses basic
-            # risk management) and by MAX_EXPLORATION_POSITIONS=1 system-wide.
+            # risk management) and by MAX_EXPLORATION_POSITIONS system-wide
+            # (multiple symbols may explore in parallel -- one per symbol,
+            # since Portfolio.buy() still forbids two positions in the same
+            # symbol regardless of origin).
             selected_symbols = {o.symbol for o in selected}
-            if self.exploration_symbol is None:
-                explorable = [o for o in candidates
-                              if o.is_exploration_eligible and o.symbol not in selected_symbols
-                              and o.symbol not in self.reconciliation_failed]
-                if explorable:
-                    best = max(explorable, key=lambda o: o.signal_strength)
-                    exp_sizing = self.risk_engine.size_exploration_entry(
-                        equity=equity, cash=self.portfolio.cash,
-                        current_portfolio_heat_usdt=sum(
-                            p.risk_amount_usdt for p in self.portfolio.positions.values()),
-                        current_crypto_value_usdt=self.portfolio.crypto_value(prices),
-                        stop_distance_frac=best.stop_pct / 100.0, confidence=best.confidence)
-                    if not exp_sizing.approved:
-                        self._log_decision(best.symbol, "rejected_exploration_sizing",
-                                            {"reason": exp_sizing.reason, "binding": exp_sizing.binding_constraint})
-                    else:
-                        try:
-                            exp_bid, exp_ask = self.md.best_bid_ask(best.symbol)
-                        except Exception as e:
-                            self._log_decision(best.symbol, "rejected_exploration_price_fetch_failed",
-                                                {"error": str(e)})
-                            exp_ask = None
-                        if exp_ask is not None:
-                            exp_pos = self.portfolio.buy(
-                                best.symbol, best_ask=exp_ask, notional_usdt=exp_sizing.notional_usdt,
-                                fee_rate=FEE_RATE, slippage=SLIPPAGE, ts_ms=now_ms(),
-                                strategy=best.strategy, regime=best.regime, confidence=best.confidence,
-                                stop_price=exp_ask * (1 - best.stop_pct / 100.0), initial_stop_pct=best.stop_pct,
-                                risk_amount_usdt=exp_sizing.risk_amount_usdt)
-                            exp_pos.trail_state = new_trail_state(exp_pos.entry_price, best.stop_pct)
-                            exp_pos.stop_price = exp_pos.trail_state["sl_price"]
-                            self.exploration_symbol = best.symbol
-                            self._log_decision(best.symbol, "entered_exploration", {
-                                "strategy": best.strategy, "champion_version": self._champion_version(best.strategy),
-                                "regime": best.regime, "confidence": best.confidence,
-                                "signal_strength": best.signal_strength, "score": best.score,
-                                "notional": exp_sizing.notional_usdt, "risk": exp_sizing.risk_amount_usdt,
-                                "risk_state": self.risk_engine.state.value,
-                            })
-                            self.log(f"  >>> BUY (EXPLORATION) {best.symbol} {exp_pos.qty:.6f} @ "
-                                     f"{exp_pos.entry_price:.4f} ({best.strategy}/{best.regime}) "
-                                     f"risk={exp_sizing.risk_amount_usdt:.2f} -- first live observation "
-                                     f"for this (symbol,strategy,regime) cell")
+            explorable = sorted(
+                (o for o in candidates if o.is_exploration_eligible and o.symbol not in selected_symbols
+                 and o.symbol not in self.reconciliation_failed and o.symbol not in self.exploration_symbols
+                 and o.symbol not in self.portfolio.positions),
+                key=lambda o: o.signal_strength, reverse=True)
+            for cand in explorable:
+                if len(self.exploration_symbols) >= MAX_EXPLORATION_POSITIONS:
+                    break
+                self._enter_exploration(cand, equity, prices)
 
         self._save_state()
         self.write_dashboard(prices)

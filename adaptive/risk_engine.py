@@ -50,11 +50,15 @@ STATE_MIN_CONFIDENCE = {
 }
 
 # Paper-exploration sizing (cold-start-deadlock fix): five times smaller
-# than the normal 0.50% risk_per_trade_pct, and capped to a single
-# concurrent exploration position system-wide -- see
-# size_exploration_entry() and meta_controller.is_exploration_eligible().
+# than the normal 0.50% risk_per_trade_pct. Capped at MAX_EXPLORATION_POSITIONS
+# concurrent exploration positions system-wide -- see size_exploration_entry()
+# and meta_controller.is_exploration_eligible(). Set to 3 (one per symbol,
+# matching MAX_POSITIONS in runner.py) so BTC/ETH/SOL can each independently
+# acquire their first live observation in parallel rather than serially --
+# Portfolio.buy()'s own one-position-per-symbol rule is still the hard
+# ceiling on how many of those 3 slots can ever be occupied at once.
 EXPLORATION_RISK_PER_TRADE_PCT = 0.10
-MAX_EXPLORATION_POSITIONS = 1
+MAX_EXPLORATION_POSITIONS = 3
 
 
 @dataclass
