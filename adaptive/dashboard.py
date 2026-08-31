@@ -120,12 +120,61 @@ def _risk_limits():
         return {}
 
 
+STRATEGIES = ("trend_momentum", "volatility_breakout", "mean_reversion", "shock_continuation")
+
+
+def _strategy_performance(all_decisions, all_trades, positions, champions):
+    """Per-strategy rollup across FULL history (not just the tailed views
+    used for the Decision Log / Trade History panels) -- signal
+    occurrences (from every cycle_ranking candidate ever logged), closed
+    trades (realized P&L, win rate), and current open exposure (unrealized
+    P&L). Read-only aggregation over already-loaded data; computes nothing
+    the trading engine doesn't already record."""
+    perf = {s: {"signals": 0, "trades_closed": 0, "wins": 0, "losses": 0,
+                 "realized_pnl": 0.0, "open_positions": [], "unrealized_pnl": 0.0}
+            for s in STRATEGIES}
+    for d in all_decisions:
+        if d.get("action") == "cycle_ranking":
+            for c in d.get("candidates", []):
+                st = c.get("strategy")
+                if st in perf:
+                    perf[st]["signals"] += 1
+    for t in all_trades:
+        st = t.get("strategy")
+        if st in perf:
+            perf[st]["trades_closed"] += 1
+            try:
+                pnl = float(t.get("net_pnl") or 0)
+            except ValueError:
+                pnl = 0.0
+            perf[st]["realized_pnl"] += pnl
+            if pnl > 0:
+                perf[st]["wins"] += 1
+            else:
+                perf[st]["losses"] += 1
+    for sym, pos in (positions or {}).items():
+        st = pos.get("strategy")
+        if st in perf:
+            perf[st]["open_positions"].append(sym)
+            perf[st]["unrealized_pnl"] += float(pos.get("unrealized_pnl") or 0)
+    for s in perf:
+        p = perf[s]
+        p["net_pnl"] = p["realized_pnl"] + p["unrealized_pnl"]
+        p["win_rate"] = (p["wins"] / p["trades_closed"] * 100) if p["trades_closed"] else None
+        rec = (champions or {}).get(s)
+        p["champion_version"] = rec["version"] if rec else None
+        p["champion_status"] = rec["status"] if rec else None
+    return perf
+
+
 def build_api():
     dash = _read_json(os.path.join(RUNTIME_DIR, "dashboard.json")) or {}
     research_status = _read_json(os.path.join(RUNTIME_DIR, "research_status.json")) or {}
     decisions = _read_jsonl_tail(os.path.join(RUNTIME_DIR, "decisions.jsonl"), 40)
+    all_decisions = _read_jsonl_tail(os.path.join(RUNTIME_DIR, "decisions.jsonl"), 100000)
     adaptation_log = _read_jsonl_tail(os.path.join(RUNTIME_DIR, "adaptation_log.jsonl"), 40)
     trades = _read_csv_tail(os.path.join(RUNTIME_DIR, "trades.csv"), 25)
+    all_trades = _read_csv_tail(os.path.join(RUNTIME_DIR, "trades.csv"), 100000)
     paper_log = _read_text_tail(os.path.join(RUNTIME_DIR, "paper.log"), 40)
     research_log = _read_text_tail(os.path.join(RUNTIME_DIR, "research.log"), 40)
 
@@ -138,8 +187,12 @@ def build_api():
     last_ranking = next((d for d in decisions if d.get("action") == "cycle_ranking"), None)
     desired_positions = len(last_ranking.get("selected", [])) if last_ranking else None
 
+    strategy_performance = _strategy_performance(
+        all_decisions, all_trades, dash.get("positions"), (dash.get("ai_brain") or {}).get("champions"))
+
     return {
         "generated_at_iso": dash.get("saved_at_iso") or dash.get("written_at_iso"),
+        "strategy_performance": strategy_performance,
         "services": {
             "adaptive": {"status": adaptive_status, "pid": adaptive_pid},
             "research": {"status": research_status_svc, "pid": research_pid},
@@ -260,6 +313,9 @@ tr:hover td { background:#0f151f; }
 
 <h2>Strategy Brain</h2>
 <div class="card" id="strategy-brain"></div>
+
+<h2>Strategy Performance <span class="muted" style="text-transform:none; letter-spacing:0;">— per strategy, full history</span></h2>
+<div class="card"><div id="strategy-performance"></div></div>
 
 <h2>Autonomous Research</h2>
 <div class="card" id="research"></div>
@@ -403,6 +459,26 @@ async function refresh(){
       return `<td>${active?'<span class="badge buy">ACTIVE CANDIDATE</span>':'<span class="muted">no signal this cycle</span>'}</td>`;
     }).join('') + '</tr>').join('') + '</tbody></table>' +
     '<div class="muted" style="margin-top:8px;">Full BULLISH/BEARISH/NEUTRAL/INACTIVE state per strategy is not currently persisted -- shown here is only whether each (symbol, strategy) appeared as an active LONG candidate in the most recent decision cycle.</div>';
+
+  const sp = d.strategy_performance || {};
+  document.getElementById('strategy-performance').innerHTML = `<table><thead><tr>
+    <th>Strategy</th><th>Champion</th><th>Signals (all-time)</th><th>Trades Closed</th><th>Win Rate</th>
+    <th>Realized PnL</th><th>Open Positions</th><th>Unrealized PnL</th><th>Net PnL</th>
+    </tr></thead><tbody>` + strategies.map(st => {
+      const p = sp[st] || {signals:0, trades_closed:0, realized_pnl:0, unrealized_pnl:0, net_pnl:0,
+                            open_positions:[], win_rate:null, champion_version:null, champion_status:null};
+      const champ = p.champion_version ? `v${p.champion_version} (${esc(p.champion_status||'')})` : '<span class="na">—</span>';
+      const noData = p.signals===0 && p.trades_closed===0 && p.open_positions.length===0;
+      return `<tr>
+        <td>${st}</td><td class="mono">${champ}</td><td>${p.signals}</td><td>${p.trades_closed}</td>
+        <td>${p.win_rate!==null?pct(p.win_rate,0):(noData?'<span class="na">no trades yet</span>':'<span class="na">—</span>')}</td>
+        <td class="${cls(p.realized_pnl)}">$${fmt(p.realized_pnl)}</td>
+        <td>${p.open_positions.length ? p.open_positions.map(esc).join(', ') : '<span class="muted">none</span>'}</td>
+        <td class="${cls(p.unrealized_pnl)}">$${fmt(p.unrealized_pnl)}</td>
+        <td class="${cls(p.net_pnl)}"><strong>$${fmt(p.net_pnl)}</strong></td>
+      </tr>`;
+    }).join('') + '</tbody></table>' +
+    '<div class="muted" style="margin-top:8px;">Signals = every time this strategy appeared as a scored candidate in a cycle-ranking snapshot, all-time. Trades/PnL cover full realized history plus currently open unrealized. Early positions are typically exploration-sized (0.10% risk) rather than normally-scored -- see the AI Brain section above for why.</div>';
 
   const r = d.research || {};
   const lr = r.last_result || {};
