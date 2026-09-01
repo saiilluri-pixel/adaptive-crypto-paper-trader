@@ -154,22 +154,31 @@ class ChampionStore:
         return restored
 
     def ensure_baseline(self, default_params: Dict[str, dict]) -> Dict[str, ChampionRecord]:
-        """Idempotent: if the file already exists (even partially), returns
-        its current contents unchanged. Only creates v1 BASELINE records
-        when the file is entirely absent -- this lets either the execution
-        process or the research service safely call it on first startup
-        without a race condition overwriting real promotion history."""
+        """Idempotent AND additive: never touches, resets, or overwrites an
+        EXISTING strategy's record (never destroys real promotion history)
+        -- but seeds a fresh v1 BASELINE record for any strategy present in
+        `default_params` that isn't in the file yet, e.g. when a new
+        strategy is added to the system after the champion file already
+        exists on a running deployment. A totally fresh/missing file seeds
+        every strategy, exactly as before."""
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        existing: Dict[str, ChampionRecord] = {}
         if self.exists():
             try:
-                return self.read()
+                existing = self.read()
             except ChampionCorruptionError:
-                pass  # fall through and re-seed a fresh baseline below
-        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        records = {strategy: ChampionRecord(strategy=strategy, version=1, parameters=dict(params),
-                                             created_at_iso=now, status=BASELINE)
-                   for strategy, params in default_params.items()}
-        self.write(records)
-        return records
+                existing = {}  # fall through and re-seed everything fresh below
+
+        missing = {s: p for s, p in default_params.items() if s not in existing}
+        if not missing:
+            return existing  # file already covers every known strategy -- no write needed
+
+        merged = dict(existing)
+        for strategy, params in missing.items():
+            merged[strategy] = ChampionRecord(strategy=strategy, version=1, parameters=dict(params),
+                                               created_at_iso=now, status=BASELINE)
+        self.write(merged)
+        return merged
 
     def promote(self, strategy: str, new_parameters: dict, current: Optional[ChampionRecord]) -> ChampionRecord:
         new_version = (current.version + 1) if current else 1

@@ -38,8 +38,8 @@ from adaptive.portfolio import Portfolio  # noqa: E402
 from adaptive.risk_engine import RiskEngine, RiskLimits, DegradationState, MAX_EXPLORATION_POSITIONS  # noqa: E402
 from adaptive.regime import classify_from_df  # noqa: E402
 from adaptive.strategies import (  # noqa: E402
-    trend_momentum, volatility_breakout, mean_reversion, shock_continuation,
-    TREND_DEFAULT_PARAMS, BREAKOUT_DEFAULT_PARAMS, MEANREV_DEFAULT_PARAMS,
+    trend_momentum, volatility_breakout, mean_reversion, shock_continuation, atr_trailing_stop,
+    TREND_DEFAULT_PARAMS, BREAKOUT_DEFAULT_PARAMS, MEANREV_DEFAULT_PARAMS, ATR_TS_DEFAULT_PARAMS,
 )
 from adaptive.stats_store import StatsStore  # noqa: E402
 from adaptive.champion_store import ChampionStore, ChampionRecord, ChampionCorruptionError  # noqa: E402
@@ -62,6 +62,7 @@ DEFAULT_PARAMS = {
     "trend_momentum": dict(TREND_DEFAULT_PARAMS),
     "volatility_breakout": dict(BREAKOUT_DEFAULT_PARAMS),
     "mean_reversion": dict(MEANREV_DEFAULT_PARAMS),
+    "atr_trailing_stop": dict(ATR_TS_DEFAULT_PARAMS),
 }
 
 
@@ -466,11 +467,13 @@ class AdaptiveRunner:
                 continue
             df_1h = self.md.candles[(sym, "1h")]
             df_15m = self.md.candles[(sym, "15m")]
+            df_4h = self.md.candles[(sym, "4h")]
             if len(df_1h) == 0 or len(df_15m) == 0:
                 continue
             regime = classify_from_df(df_1h)
             fresh_1h = fresh.get((sym, "1h"), False)
             fresh_15m = fresh.get((sym, "15m"), False)
+            fresh_4h = fresh.get((sym, "4h"), False)
             signals = {
                 "trend_momentum": (trend_momentum(df_1h, self._get_champion_params("trend_momentum")), fresh_1h),
                 "volatility_breakout": (volatility_breakout(
@@ -478,6 +481,9 @@ class AdaptiveRunner:
                 "mean_reversion": (mean_reversion(
                     df_15m, self._get_champion_params("mean_reversion")), fresh_15m),
             }
+            if len(df_4h) > 0:
+                signals["atr_trailing_stop"] = (atr_trailing_stop(
+                    df_4h, self._get_champion_params("atr_trailing_stop")), fresh_4h)
             if fresh_1h:
                 # shock_continuation is STATEFUL (mutates its detector's
                 # rolling tr_hist/prev_close on every call) -- it must be

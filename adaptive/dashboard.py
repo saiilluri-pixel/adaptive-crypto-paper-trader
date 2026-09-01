@@ -120,7 +120,8 @@ def _risk_limits():
         return {}
 
 
-STRATEGIES = ("trend_momentum", "volatility_breakout", "mean_reversion", "shock_continuation")
+STRATEGIES = ("trend_momentum", "volatility_breakout", "mean_reversion", "shock_continuation",
+              "atr_trailing_stop")
 
 
 def _strategy_performance(all_decisions, all_trades, positions, champions):
@@ -452,7 +453,7 @@ async function refresh(){
 
   // Strategy brain -- inferred only from the latest cycle's candidate list (real data), never fabricated BULLISH/BEARISH
   const activeStrats = new Set((d.last_ranking && d.last_ranking.candidates || []).map(c=>c.symbol+'|'+c.strategy));
-  const strategies = ['trend_momentum','volatility_breakout','mean_reversion','shock_continuation'];
+  const strategies = ['trend_momentum','volatility_breakout','mean_reversion','shock_continuation','atr_trailing_stop'];
   document.getElementById('strategy-brain').innerHTML = `<table><thead><tr><th>Strategy</th>${syms.map(s=>`<th>${s}</th>`).join('')}</tr></thead><tbody>` +
     strategies.map(st => `<tr><td>${st}</td>` + syms.map(s => {
       const active = activeStrats.has(s+'|'+st);

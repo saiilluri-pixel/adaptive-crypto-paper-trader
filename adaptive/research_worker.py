@@ -31,7 +31,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
 
-from adaptive.strategies import trend_momentum, volatility_breakout, mean_reversion  # noqa: E402
+from adaptive.strategies import (  # noqa: E402
+    trend_momentum, volatility_breakout, mean_reversion, atr_trailing_stop,
+)
 from adaptive.adaptation import (  # noqa: E402
     WindowResult, EvaluationResult, AdaptationEngine, NON_ADAPTIVE_STRATEGIES,
 )
@@ -40,6 +42,12 @@ STRATEGY_FNS = {
     "trend_momentum": trend_momentum,
     "volatility_breakout": volatility_breakout,
     "mean_reversion": mean_reversion,
+    # Evaluated here on the same single RESEARCH_TIMEFRAME ("1h") as every
+    # other strategy, same disclosed simplification already applied to
+    # volatility_breakout/mean_reversion (which run on 15m live) -- not a
+    # precise replica of atr_trailing_stop's live 4h timeframe, adequate
+    # for RELATIVE parameter-set comparison per this module's docstring.
+    "atr_trailing_stop": atr_trailing_stop,
 }
 
 DEFAULT_N_WINDOWS = 4
@@ -121,6 +129,10 @@ def generate_challenger_candidates(strategy_name: str, base_params: dict) -> Lis
         z = base_params.get("z_entry", -1.5)
         return [{**base_params, "z_entry": z * 0.7},
                 {**base_params, "z_entry": z * 1.3}]
+    if strategy_name == "atr_trailing_stop":
+        mult = base_params.get("mult", 2.5)
+        return [{**base_params, "mult": mult * 0.7},
+                {**base_params, "mult": mult * 1.3}]
     return []
 
 

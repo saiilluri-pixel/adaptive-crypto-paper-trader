@@ -1,5 +1,5 @@
 """
-Four independent, causal strategy modules producing a common StrategySignal.
+Five independent, causal strategy modules producing a common StrategySignal.
 
 Spot-legal semantics (adaptive spec section 1 -- no naked shorting): a
 bearish reading only ever produces direction="exit_long" (close an existing
@@ -10,12 +10,22 @@ never fed into sizing, entries, or official portfolio performance.
 
 Shock Continuation (D) reuses research/strategies/shock_aftershock.py's
 _ShockBase._shock_direction() verbatim -- the exact frozen, already-
-validated shock definition, not a reimplementation. The other three (A/B/C)
-are new, deliberately simple, fully causal implementations against the
-adaptive regime feature set; they are not ports of the legacy research/
-strategies/*.py modules (those use a different single-timeframe interface
-built for the V2/V3 backtest harness). Prime-Swing itself is not used here
-and receives no special treatment, per the adaptive spec.
+validated shock definition, not a reimplementation. Trend Momentum,
+Volatility Breakout, and Mean Reversion (A/B/C) are new, deliberately
+simple, fully causal implementations against the adaptive regime feature
+set; they are not ports of the legacy research/strategies/*.py modules
+(those use a different single-timeframe interface built for the V2/V3
+backtest harness). ATR Trailing Stop (E) is a from-scratch, faithful causal
+port of a user-supplied Pine Script v5 indicator ("ATR Trailing Stoploss"
+by ceyhun, MPL-2.0) -- the algorithm (an ATR-offset rolling-high trailing
+line with close-crossover entries/exits) is reimplemented independently in
+Python here, not a transliteration of the Pine source. Prime-Swing itself
+is not used here and receives no special treatment, per the adaptive spec
+-- and a second user-supplied script ("Prime Strategy Swing") was
+deliberately NOT added as a 6th strategy: it is the same structure-break/
+Nadaraya-Watson/Fibonacci-zone strategy family already running live in the
+legacy com.btcpaper.bot (strategy.py), so duplicating it here would
+double-count the same signal rather than add a genuinely independent one.
 """
 import os
 import sys
@@ -167,4 +177,88 @@ def shock_continuation(symbol: str, df_1h: pd.DataFrame) -> StrategySignal:
     return StrategySignal("shock_continuation", None, 0.0, 0.0, 0.0, "n/a", ["SHOCK"])
 
 
-STRATEGY_NAMES = ("trend_momentum", "volatility_breakout", "mean_reversion", "shock_continuation")
+# ── E. ATR Trailing Stop (from-scratch causal port, tunable) ───────────
+# Ported from the "ATR Trailing Stoploss" Pine Script v5 indicator by
+# ceyhun (Mozilla Public License 2.0), supplied by the user. Algorithm,
+# reimplemented independently here, not a line-by-line Pine translation:
+#   1. True range + Wilder RMA-smoothed ATR (matches Pine's ta.atr() exactly
+#      -- NOT the simple rolling-mean ATR convention used elsewhere in this
+#      codebase for regime.py/shock_aftershock.py; this strategy alone uses
+#      Wilder smoothing to stay faithful to its Pine source).
+#   2. basis[i] = high[i] - mult * atr[i]
+#   3. TS[i] = rolling max of basis over the trailing hhv_period bars
+#      (Pine's ta.highest) -- or close[i] itself during the first
+#      warmup_bars bars, exactly mirroring the source's `cum_1 < 16` guard.
+#   4. long on a close-crosses-above-TS event; exit_long (never short) on
+#      close-crosses-below-TS, mirroring Pine's ta.crossover/ta.crossunder
+#      (both bars' close-vs-TS relationship, not just the current bar's).
+# Runs on the 4h chart -- the one timeframe none of the other four
+# strategies use, filling out the multi-timeframe coverage the adaptive
+# spec originally called for (5m execution / 15m tactical / 1h regime /
+# 4h context).
+ATR_TS_DEFAULT_PARAMS = {"atr_period": 5, "hhv_period": 10, "mult": 2.5, "warmup_bars": 16}
+
+
+def _wilder_atr(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, period: int) -> np.ndarray:
+    """Pine's ta.atr(period): RMA (Wilder) smoothing of true range, seeded
+    with the simple mean of the first `period` true ranges. NaN before the
+    seed point, matching Pine's na-until-warmed behavior."""
+    n = len(highs)
+    trs = np.empty(n)
+    trs[0] = highs[0] - lows[0]
+    for i in range(1, n):
+        trs[i] = max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1]))
+    atr = np.full(n, np.nan)
+    if n >= period:
+        atr[period - 1] = trs[:period].mean()
+        alpha = 1.0 / period
+        for i in range(period, n):
+            atr[i] = alpha * trs[i] + (1 - alpha) * atr[i - 1]
+    return atr
+
+
+def atr_trailing_stop(df_4h: pd.DataFrame, params: Optional[dict] = None) -> StrategySignal:
+    p = {**ATR_TS_DEFAULT_PARAMS, **(params or {})}
+    atr_n, hhv_n, mult, warmup = p["atr_period"], p["hhv_period"], p["mult"], p["warmup_bars"]
+    min_bars = max(atr_n, hhv_n, warmup) + 2  # +2: need two consecutive valid TS values for a crossover
+    if len(df_4h) < min_bars:
+        return StrategySignal("atr_trailing_stop", None, 0.0, 0.0, 0.0, "n/a", ["TREND_UP", "HIGH_VOLATILITY"])
+
+    highs = df_4h["high"].values.astype(float)
+    lows = df_4h["low"].values.astype(float)
+    closes = df_4h["close"].values.astype(float)
+    n = len(df_4h)
+
+    atr = _wilder_atr(highs, lows, closes, atr_n)
+    basis = highs - mult * atr  # NaN wherever atr is NaN (still-warming)
+    rolling_max = pd.Series(basis).rolling(hhv_n, min_periods=hhv_n).max().values  # causal: trailing window only
+
+    ts = np.where(np.arange(n) < warmup - 1, closes, rolling_max)
+
+    if n < 2 or np.isnan(ts[-1]) or np.isnan(ts[-2]):
+        return StrategySignal("atr_trailing_stop", None, 0.0, 0.0, 0.0, "n/a", ["TREND_UP", "HIGH_VOLATILITY"])
+
+    prev_close, prev_ts = closes[-2], ts[-2]
+    last_close, last_ts = closes[-1], ts[-1]
+    last_atr = atr[-1] if not np.isnan(atr[-1]) else 0.0
+
+    buy = prev_close <= prev_ts and last_close > last_ts
+    sell = prev_close >= prev_ts and last_close < last_ts
+
+    if buy:
+        strength = float(np.clip((last_close - last_ts) / last_atr, 0.0, 1.0)) if last_atr > 0 else 0.5
+        atr_pct = (last_atr / last_close * 100) if last_close else 2.0
+        return StrategySignal("atr_trailing_stop", "long", strength, expected_rr=1.8,
+                               stop_pct=max(1.0, atr_pct * mult),
+                               exit_plan="exit on the same ATR trailing-stop line crossing back under close",
+                               regime_compatibility=["TREND_UP", "HIGH_VOLATILITY"])
+    if sell:
+        bearish = float(np.clip((last_ts - last_close) / last_atr, 0.0, 1.0)) if last_atr > 0 else 0.5
+        return StrategySignal("atr_trailing_stop", "exit_long", 0.0, 0.0, 0.0,
+                               "crossunder -- exit, never short", ["TREND_UP", "HIGH_VOLATILITY"],
+                               bearish_research_strength=bearish)
+    return StrategySignal("atr_trailing_stop", None, 0.0, 0.0, 0.0, "n/a", ["TREND_UP", "HIGH_VOLATILITY"])
+
+
+STRATEGY_NAMES = ("trend_momentum", "volatility_breakout", "mean_reversion", "shock_continuation",
+                   "atr_trailing_stop")

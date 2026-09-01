@@ -155,6 +155,37 @@ def test_rollback_is_logged_via_history_shrinking(tmp_path):
     assert store.read()["trend_momentum"].version == 3  # one step back from v4
 
 
+def test_ensure_baseline_adds_new_strategy_to_existing_file(tmp_path):
+    """A new strategy added to the system after the champion file already
+    exists on a running deployment must get seeded in additively -- never
+    by resetting or dropping the strategies already there."""
+    store = ChampionStore(str(tmp_path / "champion_state.json"))
+    original = store.ensure_baseline(DEFAULTS)
+    promoted = store.promote("trend_momentum", {"z_threshold": 0.7}, original["trend_momentum"])
+    records = dict(original)
+    records["trend_momentum"] = promoted
+    store.write(records)
+
+    expanded_defaults = dict(DEFAULTS)
+    expanded_defaults["atr_trailing_stop"] = {"atr_period": 5, "hhv_period": 10, "mult": 2.5}
+    merged = store.ensure_baseline(expanded_defaults)
+
+    assert "atr_trailing_stop" in merged
+    assert merged["atr_trailing_stop"].version == 1
+    assert merged["atr_trailing_stop"].status == BASELINE
+    assert merged["trend_momentum"].version == 2  # untouched -- real promotion preserved
+    assert merged["volatility_breakout"].version == 1  # untouched
+
+
+def test_ensure_baseline_no_write_when_nothing_missing(tmp_path):
+    path = tmp_path / "champion_state.json"
+    store = ChampionStore(str(path))
+    store.ensure_baseline(DEFAULTS)
+    mtime_before = path.stat().st_mtime_ns
+    store.ensure_baseline(DEFAULTS)  # nothing new -- must not rewrite
+    assert path.stat().st_mtime_ns == mtime_before
+
+
 def test_write_is_atomic_no_partial_file_visible(tmp_path):
     path = tmp_path / "champion_state.json"
     store = ChampionStore(str(path))
