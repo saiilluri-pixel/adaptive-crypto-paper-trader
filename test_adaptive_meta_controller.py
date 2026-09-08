@@ -4,7 +4,7 @@ import pytest
 from adaptive.stats_store import StatsStore
 from adaptive.strategies import StrategySignal
 from adaptive.meta_controller import (
-    score_opportunity, rank_and_select, rolling_correlation_matrix,
+    score_opportunity, score_short_opportunity, rank_and_select, rolling_correlation_matrix,
     MIN_QUALITY_SCORE,
 )
 
@@ -14,6 +14,13 @@ def _signal(strategy="trend_momentum", strength=0.8, stop_pct=2.0, expected_rr=2
     return StrategySignal(strategy=strategy, direction="long", strength=strength,
                            expected_rr=expected_rr, stop_pct=stop_pct, exit_plan="x",
                            regime_compatibility=list(regime_compat))
+
+
+def _bearish_signal(strategy="mean_reversion", bearish_strength=0.8, regime_compat=("RANGE",)):
+    return StrategySignal(strategy=strategy, direction="exit_long", strength=0.0,
+                           expected_rr=0.0, stop_pct=0.0, exit_plan="x",
+                           regime_compatibility=list(regime_compat),
+                           bearish_research_strength=bearish_strength)
 
 
 # ── stats_store shrinkage ────────────────────────────────────────────
@@ -231,3 +238,82 @@ def test_exploration_not_eligible_once_a_trade_exists():
     opp = score_opportunity(symbol="BTC/USDT", signal=sig, regime="TREND_UP", stats_store=store,
                              friction_penalty_pct=0.01, already_selected=[], correlation_matrix={})
     assert opp.is_exploration_eligible is False
+
+
+# ── SIMULATED SHORT scoring (adaptive/short_portfolio.py) ────────────────
+def test_score_short_opportunity_returns_none_for_a_long_signal():
+    store = StatsStore()
+    sig = _signal()  # direction="long"
+    assert score_short_opportunity(symbol="BTC/USDT", signal=sig, regime="RANGE", stats_store=store,
+                                    friction_penalty_pct=0.01, already_selected=[],
+                                    correlation_matrix={}) is None
+
+
+def test_score_short_opportunity_returns_none_for_a_neutral_signal():
+    store = StatsStore()
+    sig = StrategySignal(strategy="mean_reversion", direction=None, strength=0.0, expected_rr=0.0,
+                          stop_pct=0.0, exit_plan="x", regime_compatibility=["RANGE"])
+    assert score_short_opportunity(symbol="BTC/USDT", signal=sig, regime="RANGE", stats_store=store,
+                                    friction_penalty_pct=0.01, already_selected=[],
+                                    correlation_matrix={}) is None
+
+
+def test_score_short_opportunity_scores_a_bearish_signal():
+    store = StatsStore()
+    sig = _bearish_signal(bearish_strength=0.9)
+    opp = score_short_opportunity(symbol="BTC/USDT", signal=sig, regime="RANGE", stats_store=store,
+                                   friction_penalty_pct=0.01, already_selected=[], correlation_matrix={})
+    assert opp is not None
+    assert opp.direction == "short"
+    assert opp.signal_strength == pytest.approx(0.9)
+
+
+def test_score_short_opportunity_cold_start_same_deadlock_as_long():
+    """The short side inherits the exact same cold-start mathematics as
+    the long side (same shrunk_expectancy formula, same stats_store
+    contract) -- a fresh short cell also can't clear MIN_QUALITY_SCORE on
+    score alone, and is also exploration-eligible when the bearish signal
+    is strong enough."""
+    store = StatsStore()
+    sig = _bearish_signal(bearish_strength=1.0)
+    opp = score_short_opportunity(symbol="BTC/USDT", signal=sig, regime="RANGE", stats_store=store,
+                                   friction_penalty_pct=0.01, already_selected=[], correlation_matrix={})
+    assert opp.shrunk_edge == 0.0
+    assert opp.score < MIN_QUALITY_SCORE
+    assert opp.is_exploration_eligible is True
+
+
+def test_score_short_opportunity_stop_pct_defaults_when_zero():
+    """Strategies never populate stop_pct for an exit_long/bearish signal
+    (it's only meaningful for the long side's own trade plan) -- the short
+    scorer must substitute a sane default rather than propagate 0.0,
+    which would make position sizing divide by zero downstream."""
+    store = StatsStore()
+    sig = _bearish_signal(bearish_strength=0.8)
+    assert sig.stop_pct == 0.0
+    opp = score_short_opportunity(symbol="BTC/USDT", signal=sig, regime="RANGE", stats_store=store,
+                                   friction_penalty_pct=0.01, already_selected=[], correlation_matrix={})
+    assert opp.stop_pct > 0
+
+
+def test_rank_and_select_direction_short_filters_correctly():
+    store = StatsStore()
+    for _ in range(40):
+        store.record_trade("BTC/USDT", "mean_reversion", "RANGE", 3.0)
+        store.record_trade("ETH/USDT", "mean_reversion", "RANGE", 3.0)  # seed the long candidate's cell too
+    long_sig = _signal(strategy="mean_reversion", strength=1.0)
+    short_sig = _bearish_signal(strategy="mean_reversion", bearish_strength=1.0)
+    long_opp = score_opportunity(symbol="ETH/USDT", signal=long_sig, regime="RANGE", stats_store=store,
+                                  friction_penalty_pct=0.01, already_selected=[], correlation_matrix={})
+    short_opp = score_short_opportunity(symbol="BTC/USDT", signal=short_sig, regime="RANGE",
+                                         stats_store=store, friction_penalty_pct=0.01,
+                                         already_selected=[], correlation_matrix={})
+    both = [long_opp, short_opp]
+    selected_shorts = rank_and_select(both, correlation_matrix={}, max_positions=3, direction="short")
+    assert len(selected_shorts) == 1
+    assert selected_shorts[0].symbol == "BTC/USDT"
+    assert selected_shorts[0].direction == "short"
+
+    selected_longs = rank_and_select(both, correlation_matrix={}, max_positions=3, direction="long")
+    assert len(selected_longs) == 1
+    assert selected_longs[0].symbol == "ETH/USDT"

@@ -179,6 +179,12 @@ def build_api():
     paper_log = _read_text_tail(os.path.join(RUNTIME_DIR, "paper.log"), 40)
     research_log = _read_text_tail(os.path.join(RUNTIME_DIR, "research.log"), 40)
 
+    # SIMULATED SHORT / MARGIN book -- PAPER ONLY, own files, read the exact
+    # same way as the long book's above so it's shown with equal fidelity,
+    # never blended into the same lists/totals.
+    short_decisions = _read_jsonl_tail(os.path.join(RUNTIME_DIR, "short_decisions.jsonl"), 25)
+    short_trades = _read_csv_tail(os.path.join(RUNTIME_DIR, "short_trades.csv"), 25)
+
     adaptive_status, adaptive_pid = _service_status(SERVICE_LABELS["adaptive"])
     research_status_svc, research_pid = _service_status(SERVICE_LABELS["research"])
     bot_status, bot_pid = _service_status(SERVICE_LABELS["legacy_bot"])
@@ -209,11 +215,14 @@ def build_api():
         "trades": trades,
         "paper_log": paper_log,
         "research_log": research_log,
+        "short_decisions": short_decisions,
+        "short_trades": short_trades,
         "risk_limits": _risk_limits(),
         "data_sources": [
             "adaptive_runtime/dashboard.json", "adaptive_runtime/research_status.json",
             "adaptive_runtime/decisions.jsonl", "adaptive_runtime/adaptation_log.jsonl",
             "adaptive_runtime/trades.csv", "adaptive_runtime/paper.log", "adaptive_runtime/research.log",
+            "adaptive_runtime/short_decisions.jsonl", "adaptive_runtime/short_trades.csv",
         ],
     }
 
@@ -280,7 +289,7 @@ tr:hover td { background:#0f151f; }
 </style>
 </head>
 <body>
-<div class="banner">BINANCE SPOT ONLY &nbsp;·&nbsp; PAPER TRADING &nbsp;·&nbsp; NO FUTURES &nbsp;·&nbsp; NO MARGIN &nbsp;·&nbsp; NO REAL ORDERS</div>
+<div class="banner">BINANCE SPOT (LONG) + SIMULATED SHORT/MARGIN (PAPER) &nbsp;·&nbsp; 100% PAPER TRADING &nbsp;·&nbsp; NO REAL FUTURES &nbsp;·&nbsp; NO REAL MARGIN &nbsp;·&nbsp; NO REAL ORDERS, EVER</div>
 
 <div class="top">
   <div>
@@ -309,6 +318,10 @@ tr:hover td { background:#0f151f; }
 <h2>Positions</h2>
 <div class="card"><div id="positions"></div></div>
 
+<h2>Short Book <span class="muted" style="text-transform:none; letter-spacing:0;">— SIMULATED margin/short, PAPER ONLY, own capital, never summed with Spot above</span></h2>
+<div class="grid" id="short-cards"></div>
+<div class="card" style="margin-top:12px;"><div id="short-positions"></div></div>
+
 <h2>AI Brain</h2>
 <div class="card" id="ai-brain"></div>
 
@@ -327,8 +340,14 @@ tr:hover td { background:#0f151f; }
 <h2>Trade History</h2>
 <div class="card"><div id="trades"></div></div>
 
+<h2>Short Trade History <span class="muted" style="text-transform:none; letter-spacing:0;">— SIMULATED margin book</span></h2>
+<div class="card"><div id="short-trades"></div></div>
+
 <h2>Decision Log</h2>
 <div class="card"><div id="decisions"></div></div>
+
+<h2>Short Decision Log <span class="muted" style="text-transform:none; letter-spacing:0;">— SIMULATED margin book, own decisions file</span></h2>
+<div class="card"><div id="short-decisions"></div></div>
 
 <h2>Adaptation History</h2>
 <div class="card"><div id="adaptation"></div></div>
@@ -431,6 +450,43 @@ async function refresh(){
       }).join('') + '</tbody></table>';
   }
 
+  // SIMULATED SHORT / MARGIN book -- PAPER ONLY. Deliberately rendered
+  // from its own p.short_book object, never mixed into the Spot cards/
+  // table above -- see adaptive/short_portfolio.py for the simulation's
+  // disclosed approximations (fixed leverage, maintenance-buffer
+  // liquidation, flat daily borrow-cost).
+  const sb = p.short_book || {};
+  document.getElementById('short-cards').innerHTML = `
+    <div class="card"><div class="stat-label">Short Book Equity</div><div class="stat-value">$${fmt(sb.equity)}</div></div>
+    <div class="card"><div class="stat-label">Short Book Cash (margin free)</div><div class="stat-value">$${fmt(sb.cash)}</div></div>
+    <div class="card"><div class="stat-label">Short Book Return</div><div class="stat-value ${cls(sb.return_pct)}">${pct(sb.return_pct)}</div></div>
+    <div class="card"><div class="stat-label">Short Daily PnL</div><div class="stat-value ${cls(sb.daily_pnl_usdt)}">$${fmt(sb.daily_pnl_usdt)} (${pct(sb.daily_pnl_pct)})</div></div>
+    <div class="card"><div class="stat-label">Short Drawdown</div><div class="stat-value ${sb.drawdown_pct>0?'neg':'neu'}">${pct(sb.drawdown_pct)}</div></div>
+    <div class="card"><div class="stat-label">Short Portfolio Heat</div><div class="stat-value">${pct(sb.portfolio_heat_pct)}</div></div>
+    <div class="card"><div class="stat-label">Leverage</div><div class="stat-value">${sb.leverage?sb.leverage.toFixed(1)+'x':'<span class=na>—</span>'} <span class="muted" style="font-size:11px;">(simulated)</span></div></div>
+    <div class="card"><div class="stat-label">Short Risk State</div><div class="stat-value">${esc(sb.risk_state||'—')}</div></div>
+  `;
+  const shortPositions = sb.positions || {};
+  const shortPosKeys = Object.keys(shortPositions);
+  if(shortPosKeys.length===0){
+    document.getElementById('short-positions').innerHTML = '<div class="flatnote">NO OPEN SHORT POSITION</div>';
+  } else {
+    document.getElementById('short-positions').innerHTML = `<table><thead><tr>
+      <th>Symbol</th><th>Side</th><th>Qty</th><th>Entry</th><th>Current</th>
+      <th>Unrealized PnL</th><th>Stop</th><th>Liquidation</th><th>Margin</th><th>Leverage</th><th>Strategy</th><th>Regime</th>
+      </tr></thead><tbody>` + shortPosKeys.map(sym=>{
+        const pos = shortPositions[sym];
+        return `<tr>
+          <td>${esc(sym)}</td><td><span class="badge sell">SHORT</span></td><td>${fmt(pos.qty,6)}</td><td>$${fmt(pos.entry_price,4)}</td>
+          <td>$${fmt(pos.current_price,4)}</td>
+          <td class="${cls(pos.unrealized_pnl)}">$${fmt(pos.unrealized_pnl)}</td>
+          <td>$${fmt(pos.stop_price,4)}</td><td class="neg">$${fmt(pos.liquidation_price,4)}</td>
+          <td>$${fmt(pos.margin_reserved)}</td><td>${fmt(pos.leverage,1)}x</td>
+          <td>${esc(pos.strategy)}</td><td>${esc(pos.regime)}</td>
+        </tr>`;
+      }).join('') + '</tbody></table>';
+  }
+
   const ai = (p.ai_brain)||{};
   const champs = ai.champions||{};
   const desired = d.desired_positions;
@@ -517,6 +573,16 @@ async function refresh(){
         <td class="${cls(parseFloat(t.net_pnl))}">$${fmt(t.net_pnl)}</td>
         <td>$${fmt((parseFloat(t.entry_fee)||0)+(parseFloat(t.exit_fee)||0))}</td><td>${esc(t.exit_reason)}</td></tr>`).join('') + '</tbody></table>';
 
+  const shortTrades = d.short_trades||[];
+  document.getElementById('short-trades').innerHTML = shortTrades.length===0
+    ? '<div class="flatnote">No completed short trades yet</div>'
+    : `<table><thead><tr><th>Exit Time</th><th>Symbol</th><th>Strategy</th><th>Entry</th><th>Exit</th><th>Net PnL</th><th>Fees+Borrow</th><th>Leverage</th><th>Exit Reason</th></tr></thead><tbody>` +
+      shortTrades.map(t=>`<tr><td>${esc(t.exit_ts_ms)}</td><td>${esc(t.symbol)}</td><td>${esc(t.strategy)}</td>
+        <td>$${fmt(t.entry_price,4)}</td><td>$${fmt(t.exit_price,4)}</td>
+        <td class="${cls(parseFloat(t.net_pnl))}">$${fmt(t.net_pnl)}</td>
+        <td>$${fmt((parseFloat(t.entry_fee)||0)+(parseFloat(t.exit_fee)||0)+(parseFloat(t.borrow_cost)||0))}</td>
+        <td>${fmt(t.leverage,1)}x</td><td>${esc(t.exit_reason)}</td></tr>`).join('') + '</tbody></table>';
+
   const decisions = (d.decisions||[]).filter(x=>x.action!=='cycle_ranking').slice(0,25);
   const heartbeat = d.last_ranking ? `<div class="muted" style="margin-bottom:10px;">Most recent cycle: ${esc(d.last_ranking.ts_iso)}
     (${ago(d.last_ranking.ts_iso)}) — ${(d.last_ranking.candidates||[]).length} candidate(s), risk_state=${esc(d.last_ranking.risk_state)}.
@@ -526,6 +592,13 @@ async function refresh(){
     ? heartbeat + '<div class="flatnote">No per-symbol decisions yet (entries, rejections, exits) — only routine cycle-ranking snapshots so far, which are intentionally not listed row-by-row here since there are hundreds of them and each one just confirms "still scanning, nothing qualified."</div>'
     : heartbeat + `<table><thead><tr><th>Time</th><th>Symbol</th><th>Action</th><th>Detail</th></tr></thead><tbody>` +
       decisions.map(x=>`<tr><td>${esc(x.ts_iso)}</td><td>${esc(x.symbol)}</td><td>${esc(x.action)}</td>
+        <td class="mono">${esc(JSON.stringify(Object.fromEntries(Object.entries(x).filter(([k])=>!['ts_iso','symbol','action'].includes(k)))))}</td></tr>`).join('') + '</tbody></table>';
+
+  const shortDecisions = d.short_decisions||[];
+  document.getElementById('short-decisions').innerHTML = shortDecisions.length===0
+    ? '<div class="flatnote">No short-book decisions yet (entries, rejections, exits, exploration)</div>'
+    : `<table><thead><tr><th>Time</th><th>Symbol</th><th>Action</th><th>Detail</th></tr></thead><tbody>` +
+      shortDecisions.map(x=>`<tr><td>${esc(x.ts_iso)}</td><td>${esc(x.symbol)}</td><td>${esc(x.action)}</td>
         <td class="mono">${esc(JSON.stringify(Object.fromEntries(Object.entries(x).filter(([k])=>!['ts_iso','symbol','action'].includes(k)))))}</td></tr>`).join('') + '</tbody></table>';
 
   const adapt = d.adaptation_log||[];

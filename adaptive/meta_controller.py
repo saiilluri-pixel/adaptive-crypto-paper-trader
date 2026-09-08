@@ -170,10 +170,54 @@ def score_opportunity(*, symbol: str, signal, regime: str, stats_store,
                         confidence=1.0 - uncertainty, is_exploration_eligible=exploration_eligible)
 
 
+def score_short_opportunity(*, symbol: str, signal, regime: str, stats_store,
+                             friction_penalty_pct: float, already_selected: List[Tuple[str, str]],
+                             correlation_matrix: Dict[Tuple[str, str], float]) -> Optional[Opportunity]:
+    """SIMULATED SHORT scoring (adaptive/short_portfolio.py) -- structurally
+    identical to score_opportunity(), just fed by the bearish side of a
+    signal. A StrategySignal only carries bearish_research_strength when
+    direction=="exit_long" (a bearish reading); this is the one place in
+    the codebase that treats that number as an ACTIVE short-entry signal
+    rather than research-only context, since every strategy already
+    computes it causally and it was explicitly built to support this. Uses
+    a SEPARATE stats_store (short-side empirical-Bayes evidence is
+    genuinely different from the long side's) but the SAME regime_fit/
+    robustness/penalty machinery as the long side. Returns None if this
+    signal has no bearish reading to score."""
+    if signal.direction != "exit_long" or signal.bearish_research_strength <= 0:
+        return None
+    cell = stats_store.get(symbol, signal.strategy, regime)
+    shrunk_edge = stats_store.shrunk_expectancy(symbol, signal.strategy, regime)
+    uncertainty = stats_store.uncertainty(symbol, signal.strategy, regime)
+    rfit = regime_fit_score(signal.regime_compatibility, regime)
+    robust = robustness_multiplier(cell)
+    unc_pen = uncertainty * UNCERTAINTY_PENALTY_COEF
+    dd_pen = cell.max_dd_pct * DRAWDOWN_PENALTY_COEF
+    corr_pen = correlation_penalty(symbol, "short", already_selected, correlation_matrix)
+
+    strength = signal.bearish_research_strength
+    score = (shrunk_edge * strength * rfit * robust
+             - friction_penalty_pct - unc_pen - dd_pen - corr_pen)
+    exploration_eligible = cell.n == 0 and strength >= MIN_EXPLORATION_SIGNAL_STRENGTH
+
+    return Opportunity(symbol=symbol, strategy=signal.strategy, regime=regime,
+                        direction="short", score=score, shrunk_edge=shrunk_edge,
+                        signal_strength=strength, regime_fit=rfit, robustness=robust,
+                        friction_penalty=friction_penalty_pct, uncertainty_penalty=unc_pen,
+                        drawdown_penalty=dd_pen, correlation_penalty=corr_pen,
+                        stop_pct=signal.stop_pct if signal.stop_pct > 0 else 2.0,
+                        expected_rr=signal.expected_rr if signal.expected_rr > 0 else 1.5,
+                        confidence=1.0 - uncertainty, is_exploration_eligible=exploration_eligible)
+
+
 def rank_and_select(candidates: List[Opportunity],
                      correlation_matrix: Dict[Tuple[str, str], float],
-                     max_positions: int = 3) -> List[Opportunity]:
-    remaining = sorted([c for c in candidates if c.direction == "long"],
+                     max_positions: int = 3, direction: str = "long") -> List[Opportunity]:
+    """direction: "long" (default, Spot) or "short" (SIMULATED margin,
+    adaptive/short_portfolio.py) -- the two are always ranked/selected
+    independently via separate calls, never mixed into one list, since
+    they draw on separate portfolios/risk budgets/capital pools."""
+    remaining = sorted([c for c in candidates if c.direction == direction],
                         key=lambda o: o.score, reverse=True)
     selected: List[Opportunity] = []
     selected_pairs: List[Tuple[str, str]] = []

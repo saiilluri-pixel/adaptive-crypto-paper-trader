@@ -67,3 +67,28 @@ def check_stop_bar(trail_state: dict, open_: float, high: float, low: float) -> 
     if low <= stop:
         return stop  # ordinary intrabar touch
     return None
+
+
+# ── SHORT side (SIMULATED margin -- see adaptive/short_portfolio.py) ────
+# TrailingStop already handles side="short" natively (Pine-fidelity ratchet
+# math validated in test_trailing_stop.py long before this module existed)
+# -- these are the short-side mirrors of the long-side helpers above, not a
+# reimplementation. A short's stop sits ABOVE entry and only ever ratchets
+# DOWN as price falls in the position's favor, the exact mirror image of
+# the long-side contract.
+
+def new_short_trail_state(entry_price: float, init_stop_pct: float) -> dict:
+    ts = TrailingStop("short", entry_price, init_stop_pct)
+    return _serialize(ts)
+
+
+def check_short_stop_bar(trail_state: dict, open_: float, high: float, low: float) -> Optional[float]:
+    """Mirror of check_stop_bar for a short: the stop sits ABOVE entry, so
+    it's hit when price rises to or through it -- checked against the
+    bar's OPEN (gap) and HIGH (ordinary touch), not LOW/OPEN as for a long."""
+    stop = trail_state["sl_price"]
+    if open_ >= stop:
+        return open_  # gap-through: earliest price this bar actually traded at
+    if high >= stop:
+        return stop  # ordinary intrabar touch
+    return None
