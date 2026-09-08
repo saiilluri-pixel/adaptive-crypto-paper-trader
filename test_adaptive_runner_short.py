@@ -250,7 +250,16 @@ def test_restart_with_open_short_preserves_entry_contract(tmp_path):
     assert pos.trail_state["sl_price"] == pytest.approx(105.0)
 
 
-def test_gap_blocks_short_entries_but_not_short_exit_management(tmp_path):
+def test_gap_does_not_block_short_stop_management(tmp_path):
+    """Proves the gap flag never blocks _manage_short_position's own
+    stop/liquidation check (that method runs unconditionally, ahead of
+    the reconciliation_failed skip used for NEW entries). Does NOT
+    exercise _exit_short_signal_management (a bullish signal covering a
+    short) -- that path sits inside the per-symbol loop behind
+    `self.portfolio.held_qty(sym) > 0 or sym in self.reconciliation_failed:
+    continue`, so it IS gated by a gap on this symbol, same as the
+    long-book's pre-existing (and out-of-scope-to-change-here) exit_long
+    signal path."""
     now = BASE + 300 * HOUR
     candles = _full_candle_set(now)
     ex = FakeExchange(now, candles_by_key=candles)

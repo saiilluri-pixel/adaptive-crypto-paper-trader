@@ -51,24 +51,24 @@ from adaptive.trailing import (  # noqa: E402
     new_trail_state, update_trail, check_stop_bar, new_short_trail_state, check_short_stop_bar,
 )
 
-# £2,000 real intended trading capital, converted to USDT-equivalent for
-# this system's USDT-denominated Spot bookkeeping at the live GBP/USD rate
-# checked 2026-09-08 (1 GBP = 1.3542 USD -- Yahoo Finance/xe.com). This is
-# a ONE-TIME conversion fixed at deployment, not a live/continuously
-# updated FX rate -- the system does not track GBP/USD movement during
-# operation, only at this starting-capital calculation. Paper trading only;
-# no real currency is held or converted.
-START_CAPITAL = 2_708.40
+# £2,000 real intended trading capital, converted to USDT-equivalent at the
+# live GBP/USD rate checked 2026-09-08 (1 GBP = 1.3542 USD -- Yahoo
+# Finance/xe.com) -- a ONE-TIME conversion fixed at deployment, not a
+# live/continuously updated FX rate. That £2,000-equivalent (2,708.40
+# USDT) is SPLIT evenly across the two books below, per explicit user
+# confirmation (asked directly: split one £2,000 vs. two separate £2,000
+# pools -- user chose split) -- "we don't have more capital" means total
+# capital across the whole system is £2,000, not £2,000 per book. Paper
+# trading only; no real currency is held or converted.
+_TOTAL_CAPITAL_USDT = 2_708.40
+START_CAPITAL = _TOTAL_CAPITAL_USDT / 2       # Spot long book: 1,354.20
 
 # SIMULATED SHORT / MARGIN capital (adaptive/short_portfolio.py) -- PAPER
-# ONLY, not a real margin account. Given the SAME £2,000 real-money
-# intent, this is deliberately its OWN separate £2,000-equivalent balance
-# (mirroring how a real trader would fund a separate margin/futures
-# wallet from a Spot wallet, not split one pool across two), not carved
-# out of START_CAPITAL above. If the intent was actually to split one
-# £2,000 total between the two books, this is a disclosed assumption to
-# correct, not a silent decision.
-SHORT_START_CAPITAL = 2_708.40
+# ONLY, not a real margin account. The other half of the same split total
+# above, kept in its own ledger/state file (own capital tracking, own
+# risk engine/breakers) purely for structural isolation from the long
+# book -- NOT because it is additional capital beyond the £2,000 total.
+SHORT_START_CAPITAL = _TOTAL_CAPITAL_USDT / 2  # Short book: 1,354.20
 SHORT_LEVERAGE = 2.0  # conservative default -- see short_portfolio.DEFAULT_LEVERAGE
 
 FEE_RATE = 0.001       # 0.1% Binance Spot taker, configurable

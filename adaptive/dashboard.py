@@ -124,19 +124,26 @@ STRATEGIES = ("trend_momentum", "volatility_breakout", "mean_reversion", "shock_
               "atr_trailing_stop")
 
 
-def _strategy_performance(all_decisions, all_trades, positions, champions):
+def _strategy_performance(all_decisions, all_trades, positions, champions, candidates_key="candidates"):
     """Per-strategy rollup across FULL history (not just the tailed views
     used for the Decision Log / Trade History panels) -- signal
     occurrences (from every cycle_ranking candidate ever logged), closed
     trades (realized P&L, win rate), and current open exposure (unrealized
     P&L). Read-only aggregation over already-loaded data; computes nothing
-    the trading engine doesn't already record."""
+    the trading engine doesn't already record.
+
+    candidates_key: the joint cycle_ranking event (see runner.py's
+    _log_decision "cycle_ranking" call) carries the long book's candidates
+    under "candidates" and the SIMULATED short book's under
+    "short_candidates" -- both books' every-cycle events live in the SAME
+    decisions.jsonl record, so the caller selects which side to count via
+    this key rather than needing two separate cycle_ranking logs."""
     perf = {s: {"signals": 0, "trades_closed": 0, "wins": 0, "losses": 0,
                  "realized_pnl": 0.0, "open_positions": [], "unrealized_pnl": 0.0}
             for s in STRATEGIES}
     for d in all_decisions:
         if d.get("action") == "cycle_ranking":
-            for c in d.get("candidates", []):
+            for c in d.get(candidates_key, []):
                 st = c.get("strategy")
                 if st in perf:
                     perf[st]["signals"] += 1
@@ -184,6 +191,7 @@ def build_api():
     # never blended into the same lists/totals.
     short_decisions = _read_jsonl_tail(os.path.join(RUNTIME_DIR, "short_decisions.jsonl"), 25)
     short_trades = _read_csv_tail(os.path.join(RUNTIME_DIR, "short_trades.csv"), 25)
+    all_short_trades = _read_csv_tail(os.path.join(RUNTIME_DIR, "short_trades.csv"), 100000)
 
     adaptive_status, adaptive_pid = _service_status(SERVICE_LABELS["adaptive"])
     research_status_svc, research_pid = _service_status(SERVICE_LABELS["research"])
@@ -196,10 +204,17 @@ def build_api():
 
     strategy_performance = _strategy_performance(
         all_decisions, all_trades, dash.get("positions"), (dash.get("ai_brain") or {}).get("champions"))
+    # short-side rollup: signals come from the SAME joint cycle_ranking
+    # events (all_decisions, "short_candidates" key), but trades/open
+    # exposure come from the short book's own files.
+    strategy_performance_short = _strategy_performance(
+        all_decisions, all_short_trades, (dash.get("short_book") or {}).get("positions"),
+        (dash.get("ai_brain") or {}).get("champions"), candidates_key="short_candidates")
 
     return {
         "generated_at_iso": dash.get("saved_at_iso") or dash.get("written_at_iso"),
         "strategy_performance": strategy_performance,
+        "strategy_performance_short": strategy_performance_short,
         "services": {
             "adaptive": {"status": adaptive_status, "pid": adaptive_pid},
             "research": {"status": research_status_svc, "pid": research_pid},
@@ -330,6 +345,9 @@ tr:hover td { background:#0f151f; }
 
 <h2>Strategy Performance <span class="muted" style="text-transform:none; letter-spacing:0;">— per strategy, full history</span></h2>
 <div class="card"><div id="strategy-performance"></div></div>
+
+<h2>Short Strategy Performance <span class="muted" style="text-transform:none; letter-spacing:0;">— SIMULATED margin book, per strategy, full history</span></h2>
+<div class="card"><div id="strategy-performance-short"></div></div>
 
 <h2>Autonomous Research</h2>
 <div class="card" id="research"></div>
@@ -517,25 +535,30 @@ async function refresh(){
     }).join('') + '</tr>').join('') + '</tbody></table>' +
     '<div class="muted" style="margin-top:8px;">Full BULLISH/BEARISH/NEUTRAL/INACTIVE state per strategy is not currently persisted -- shown here is only whether each (symbol, strategy) appeared as an active LONG candidate in the most recent decision cycle.</div>';
 
-  const sp = d.strategy_performance || {};
-  document.getElementById('strategy-performance').innerHTML = `<table><thead><tr>
-    <th>Strategy</th><th>Champion</th><th>Signals (all-time)</th><th>Trades Closed</th><th>Win Rate</th>
-    <th>Realized PnL</th><th>Open Positions</th><th>Unrealized PnL</th><th>Net PnL</th>
-    </tr></thead><tbody>` + strategies.map(st => {
-      const p = sp[st] || {signals:0, trades_closed:0, realized_pnl:0, unrealized_pnl:0, net_pnl:0,
-                            open_positions:[], win_rate:null, champion_version:null, champion_status:null};
-      const champ = p.champion_version ? `v${p.champion_version} (${esc(p.champion_status||'')})` : '<span class="na">—</span>';
-      const noData = p.signals===0 && p.trades_closed===0 && p.open_positions.length===0;
-      return `<tr>
-        <td>${st}</td><td class="mono">${champ}</td><td>${p.signals}</td><td>${p.trades_closed}</td>
-        <td>${p.win_rate!==null?pct(p.win_rate,0):(noData?'<span class="na">no trades yet</span>':'<span class="na">—</span>')}</td>
-        <td class="${cls(p.realized_pnl)}">$${fmt(p.realized_pnl)}</td>
-        <td>${p.open_positions.length ? p.open_positions.map(esc).join(', ') : '<span class="muted">none</span>'}</td>
-        <td class="${cls(p.unrealized_pnl)}">$${fmt(p.unrealized_pnl)}</td>
-        <td class="${cls(p.net_pnl)}"><strong>$${fmt(p.net_pnl)}</strong></td>
-      </tr>`;
-    }).join('') + '</tbody></table>' +
-    '<div class="muted" style="margin-top:8px;">Signals = every time this strategy appeared as a scored candidate in a cycle-ranking snapshot, all-time. Trades/PnL cover full realized history plus currently open unrealized. Early positions are typically exploration-sized (0.10% risk) rather than normally-scored -- see the AI Brain section above for why.</div>';
+  function renderStrategyPerf(elId, sp, footnote){
+    document.getElementById(elId).innerHTML = `<table><thead><tr>
+      <th>Strategy</th><th>Champion</th><th>Signals (all-time)</th><th>Trades Closed</th><th>Win Rate</th>
+      <th>Realized PnL</th><th>Open Positions</th><th>Unrealized PnL</th><th>Net PnL</th>
+      </tr></thead><tbody>` + strategies.map(st => {
+        const p = sp[st] || {signals:0, trades_closed:0, realized_pnl:0, unrealized_pnl:0, net_pnl:0,
+                              open_positions:[], win_rate:null, champion_version:null, champion_status:null};
+        const champ = p.champion_version ? `v${p.champion_version} (${esc(p.champion_status||'')})` : '<span class="na">—</span>';
+        const noData = p.signals===0 && p.trades_closed===0 && p.open_positions.length===0;
+        return `<tr>
+          <td>${st}</td><td class="mono">${champ}</td><td>${p.signals}</td><td>${p.trades_closed}</td>
+          <td>${p.win_rate!==null?pct(p.win_rate,0):(noData?'<span class="na">no trades yet</span>':'<span class="na">—</span>')}</td>
+          <td class="${cls(p.realized_pnl)}">$${fmt(p.realized_pnl)}</td>
+          <td>${p.open_positions.length ? p.open_positions.map(esc).join(', ') : '<span class="muted">none</span>'}</td>
+          <td class="${cls(p.unrealized_pnl)}">$${fmt(p.unrealized_pnl)}</td>
+          <td class="${cls(p.net_pnl)}"><strong>$${fmt(p.net_pnl)}</strong></td>
+        </tr>`;
+      }).join('') + '</tbody></table>' +
+      `<div class="muted" style="margin-top:8px;">${footnote}</div>`;
+  }
+  renderStrategyPerf('strategy-performance', d.strategy_performance || {},
+    'Signals = every time this strategy appeared as a scored LONG candidate in a cycle-ranking snapshot, all-time. Trades/PnL cover full realized history plus currently open unrealized. Early positions are typically exploration-sized (0.10%-0.05% risk) rather than normally-scored -- see the AI Brain section above for why.');
+  renderStrategyPerf('strategy-performance-short', d.strategy_performance_short || {},
+    'SIMULATED margin book (paper only, see Short Book above). Signals = every time this strategy appeared as a scored SHORT candidate (a bearish reading) in a cycle-ranking snapshot, all-time. Trades/PnL are this book\'s own, never summed with the long table above.');
 
   const r = d.research || {};
   const lr = r.last_result || {};
