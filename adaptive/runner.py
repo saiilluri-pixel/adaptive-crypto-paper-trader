@@ -48,7 +48,14 @@ from adaptive.meta_controller import (  # noqa: E402
 )
 from adaptive.trailing import new_trail_state, update_trail, check_stop_bar  # noqa: E402
 
-START_CAPITAL = 10_000.0
+# £2,000 real intended trading capital, converted to USDT-equivalent for
+# this system's USDT-denominated Spot bookkeeping at the live GBP/USD rate
+# checked 2026-09-08 (1 GBP = 1.3542 USD -- Yahoo Finance/xe.com). This is
+# a ONE-TIME conversion fixed at deployment, not a live/continuously
+# updated FX rate -- the system does not track GBP/USD movement during
+# operation, only at this starting-capital calculation. Paper trading only;
+# no real currency is held or converted.
+START_CAPITAL = 2_708.40
 FEE_RATE = 0.001       # 0.1% Binance Spot taker, configurable
 SLIPPAGE = 0.0002
 TYPICAL_SPREAD_PCT = 0.02
@@ -209,7 +216,8 @@ class AdaptiveRunner:
             equity=equity, cash=self.portfolio.cash,
             current_portfolio_heat_usdt=sum(p.risk_amount_usdt for p in self.portfolio.positions.values()),
             current_crypto_value_usdt=self.portfolio.crypto_value(prices),
-            stop_distance_frac=opp.stop_pct / 100.0, confidence=opp.confidence)
+            stop_distance_frac=opp.stop_pct / 100.0, confidence=opp.confidence,
+            signal_strength=opp.signal_strength)
         if not sizing.approved:
             self._log_decision(opp.symbol, "rejected_exploration_sizing",
                                 {"reason": sizing.reason, "binding": sizing.binding_constraint})

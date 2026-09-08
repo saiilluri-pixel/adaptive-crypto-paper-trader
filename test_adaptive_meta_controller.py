@@ -196,6 +196,21 @@ def test_exploration_eligible_when_zero_trades_and_strong_signal():
     assert opp.is_exploration_eligible is True
 
 
+def test_lowered_floor_admits_signals_the_old_floor_would_have_rejected():
+    """Regression/intent test for the 0.5 -> 0.35 floor change made in
+    response to real trade-frequency feedback: a moderate-strength signal
+    that would have been rejected under the historical 0.5 floor must now
+    be admitted."""
+    from adaptive.meta_controller import MIN_EXPLORATION_SIGNAL_STRENGTH
+    assert MIN_EXPLORATION_SIGNAL_STRENGTH == pytest.approx(0.35)
+    store = StatsStore()
+    moderate_strength = 0.42  # below the old 0.5 floor, above the new 0.35 one
+    sig = _signal(strength=moderate_strength)
+    opp = score_opportunity(symbol="BTC/USDT", signal=sig, regime="TREND_UP", stats_store=store,
+                             friction_penalty_pct=0.01, already_selected=[], correlation_matrix={})
+    assert opp.is_exploration_eligible is True
+
+
 def test_exploration_not_eligible_for_weak_signal():
     """Weak raw signal must still be rejected even at n=0 -- exploration
     is not a blanket bypass, it has its own quality floor."""

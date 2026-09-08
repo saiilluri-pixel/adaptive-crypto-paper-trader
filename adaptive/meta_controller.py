@@ -77,7 +77,16 @@ CORRELATION_PENALTY_COEF = 0.6
 # acquire that first live observation -- once n>=1, shrinkage naturally
 # takes over and normal scoring governs every subsequent decision for
 # that cell, including whether to ever trade it again.
-MIN_EXPLORATION_SIGNAL_STRENGTH = 0.5
+#
+# Lowered from 0.5 to 0.35 in response to real trade-frequency feedback
+# after 9 days live (5 trades total, 3 of 5 strategies never fired at all
+# -- their required conditions, e.g. a sustained trend or a 3x-ATR shock,
+# simply hadn't occurred yet, which no threshold change can fix; but
+# mean_reversion signals between 0.35-0.5 strength were being filtered
+# out entirely). Paired with confidence-scaled exploration risk sizing
+# (risk_engine.EXPLORATION_RISK_MIN_PCT/MAX_PCT) so admitting weaker
+# signals doesn't mean risking the same amount on them as strong ones.
+MIN_EXPLORATION_SIGNAL_STRENGTH = 0.35
 
 
 @dataclass

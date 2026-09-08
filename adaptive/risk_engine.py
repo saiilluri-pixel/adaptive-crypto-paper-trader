@@ -57,8 +57,20 @@ STATE_MIN_CONFIDENCE = {
 # acquire their first live observation in parallel rather than serially --
 # Portfolio.buy()'s own one-position-per-symbol rule is still the hard
 # ceiling on how many of those 3 slots can ever be occupied at once.
-EXPLORATION_RISK_PER_TRADE_PCT = 0.10
+EXPLORATION_RISK_PER_TRADE_PCT = 0.10  # kept as the historical/documented ceiling value
 MAX_EXPLORATION_POSITIONS = 3
+
+# Confidence-scaled exploration risk: a signal right at the eligibility
+# floor (MIN_EXPLORATION_SIGNAL_STRENGTH in meta_controller.py) risks the
+# MIN fraction; a maximum-strength (1.0) signal risks the MAX fraction
+# (unchanged from the original flat 0.10% ceiling -- loosening the
+# eligibility floor to admit weaker signals must not also raise the
+# worst-case risk per trade). Chosen when the eligibility floor was
+# lowered from 0.5 to 0.35 in response to real trade-frequency feedback,
+# so that trading more (weaker) signals doesn't mean trading them all at
+# the same size as the strong ones.
+EXPLORATION_RISK_MIN_PCT = 0.05
+EXPLORATION_RISK_MAX_PCT = 0.10
 
 
 @dataclass
@@ -137,26 +149,36 @@ class RiskEngine:
 
     def size_exploration_entry(self, *, equity: float, cash: float, current_portfolio_heat_usdt: float,
                                 current_crypto_value_usdt: float, stop_distance_frac: float,
-                                confidence: float) -> SizingResult:
+                                confidence: float, signal_strength: float) -> SizingResult:
         """Tightly-bounded PAPER EXPLORATION sizing (cold-start-deadlock
         fix -- see meta_controller.is_exploration_eligible() for the
-        eligibility gate this is paired with). Uses
-        EXPLORATION_RISK_PER_TRADE_PCT (0.10% of equity) instead of the
-        normal risk_per_trade_pct (0.50%) -- five times smaller -- but is
-        otherwise identical to size_entry(): same degradation-state gate,
-        same confidence floor, same four caps (cash reserve, symbol
-        allocation, portfolio heat, total exposure). Exploration never
-        bypasses basic risk management; it only accepts a smaller,
-        deliberately-priced position to acquire the FIRST live observation
-        for a (symbol, strategy, regime) cell that empirical-Bayes
-        shrinkage would otherwise keep at exactly zero expected edge
-        forever, since a cell with zero trades can never produce a
-        nonzero shrunk_expectancy for shrinkage to update from."""
+        eligibility gate this is paired with). Otherwise identical to
+        size_entry(): same degradation-state gate, same confidence floor,
+        same four caps (cash reserve, symbol allocation, portfolio heat,
+        total exposure). Exploration never bypasses basic risk management;
+        it only accepts a smaller, deliberately-priced position to acquire
+        the FIRST live observation for a (symbol, strategy, regime) cell
+        that empirical-Bayes shrinkage would otherwise keep at exactly
+        zero expected edge forever, since a cell with zero trades can
+        never produce a nonzero shrunk_expectancy for shrinkage to update
+        from.
+
+        risk_pct is CONFIDENCE-SCALED between EXPLORATION_RISK_MIN_PCT (at
+        signal_strength == the eligibility floor) and EXPLORATION_RISK_MAX_PCT
+        (at signal_strength == 1.0) -- not a flat rate -- so that admitting
+        weaker signals (a lower eligibility floor) doesn't also mean
+        risking the same amount on them as on strong ones."""
+        from adaptive.meta_controller import MIN_EXPLORATION_SIGNAL_STRENGTH
+        floor = MIN_EXPLORATION_SIGNAL_STRENGTH
+        span = max(1.0 - floor, 1e-9)
+        frac = min(max((signal_strength - floor) / span, 0.0), 1.0)
+        risk_pct = EXPLORATION_RISK_MIN_PCT + (EXPLORATION_RISK_MAX_PCT - EXPLORATION_RISK_MIN_PCT) * frac
+
         result = self.size_entry(equity=equity, cash=cash,
                                   current_portfolio_heat_usdt=current_portfolio_heat_usdt,
                                   current_crypto_value_usdt=current_crypto_value_usdt,
                                   stop_distance_frac=stop_distance_frac, confidence=confidence,
-                                  risk_pct_override=EXPLORATION_RISK_PER_TRADE_PCT)
+                                  risk_pct_override=risk_pct)
         if result.approved:
             result.binding_constraint = "exploration:" + result.binding_constraint
         return result

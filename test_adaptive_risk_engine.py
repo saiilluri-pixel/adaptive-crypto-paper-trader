@@ -152,23 +152,39 @@ def test_halted_state_blocks_all_new_entries_regardless_of_confidence():
     assert not r.approved
 
 
-def test_exploration_risk_capped_at_point_one_percent():
-    from adaptive.risk_engine import EXPLORATION_RISK_PER_TRADE_PCT
-    assert EXPLORATION_RISK_PER_TRADE_PCT == pytest.approx(0.10)
+def test_exploration_risk_capped_at_max_pct_for_full_strength_signal():
+    from adaptive.risk_engine import EXPLORATION_RISK_MAX_PCT
+    assert EXPLORATION_RISK_MAX_PCT == pytest.approx(0.10)
     eng = _engine()
     r = eng.size_exploration_entry(equity=10000, cash=10000, current_portfolio_heat_usdt=0,
-                                    current_crypto_value_usdt=0, stop_distance_frac=0.05, confidence=0.8)
+                                    current_crypto_value_usdt=0, stop_distance_frac=0.05, confidence=0.8,
+                                    signal_strength=1.0)
     assert r.approved
-    assert r.risk_amount_usdt == pytest.approx(10000 * 0.001)  # 0.10% of equity
+    assert r.risk_amount_usdt == pytest.approx(10000 * 0.001)  # 0.10% of equity at max strength
     assert r.binding_constraint.startswith("exploration:")
 
 
-def test_exploration_risk_five_times_smaller_than_normal():
+def test_exploration_risk_scales_with_signal_strength():
+    from adaptive.meta_controller import MIN_EXPLORATION_SIGNAL_STRENGTH
+    eng = _engine()
+    weak = eng.size_exploration_entry(equity=10000, cash=10000, current_portfolio_heat_usdt=0,
+                                       current_crypto_value_usdt=0, stop_distance_frac=0.05, confidence=0.8,
+                                       signal_strength=MIN_EXPLORATION_SIGNAL_STRENGTH)  # right at the floor
+    strong = eng.size_exploration_entry(equity=10000, cash=10000, current_portfolio_heat_usdt=0,
+                                         current_crypto_value_usdt=0, stop_distance_frac=0.05, confidence=0.8,
+                                         signal_strength=1.0)
+    assert weak.risk_amount_usdt == pytest.approx(10000 * 0.0005)  # EXPLORATION_RISK_MIN_PCT
+    assert strong.risk_amount_usdt == pytest.approx(10000 * 0.001)  # EXPLORATION_RISK_MAX_PCT
+    assert weak.risk_amount_usdt < strong.risk_amount_usdt
+
+
+def test_exploration_risk_five_times_smaller_than_normal_at_max_strength():
     eng = _engine()
     normal = eng.size_entry(equity=10000, cash=10000, current_portfolio_heat_usdt=0,
                              current_crypto_value_usdt=0, stop_distance_frac=0.05, confidence=0.8)
     exploration = eng.size_exploration_entry(equity=10000, cash=10000, current_portfolio_heat_usdt=0,
-                                              current_crypto_value_usdt=0, stop_distance_frac=0.05, confidence=0.8)
+                                              current_crypto_value_usdt=0, stop_distance_frac=0.05, confidence=0.8,
+                                              signal_strength=1.0)
     assert exploration.risk_amount_usdt == pytest.approx(normal.risk_amount_usdt / 5)
 
 
@@ -176,7 +192,8 @@ def test_exploration_still_respects_portfolio_heat_cap():
     eng = _engine(max_portfolio_heat_pct=1.5)
     # heat already fully used by normal-sized positions -- exploration must not bypass this
     r = eng.size_exploration_entry(equity=10000, cash=10000, current_portfolio_heat_usdt=150.0,
-                                    current_crypto_value_usdt=2000, stop_distance_frac=0.05, confidence=0.8)
+                                    current_crypto_value_usdt=2000, stop_distance_frac=0.05, confidence=0.8,
+                                    signal_strength=1.0)
     assert not r.approved
 
 
@@ -186,7 +203,8 @@ def test_exploration_blocked_in_halted_state():
     eng = _engine()
     eng.set_state(DegradationState.HALTED, "test")
     r = eng.size_exploration_entry(equity=10000, cash=10000, current_portfolio_heat_usdt=0,
-                                    current_crypto_value_usdt=0, stop_distance_frac=0.05, confidence=1.0)
+                                    current_crypto_value_usdt=0, stop_distance_frac=0.05, confidence=1.0,
+                                    signal_strength=1.0)
     assert not r.approved
 
 
