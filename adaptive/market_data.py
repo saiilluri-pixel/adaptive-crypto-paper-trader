@@ -1,7 +1,7 @@
 """
-REST-primary market data for BTC/USDT, ETH/USDT, SOL/USDT across
-5m/15m/1h/4h timeframes, plus live best bid/ask. Public Binance Spot
-endpoints only (ccxt.binance(), no keys, no authentication).
+REST-primary market data for BTC/USDT, ETH/USDT, SOL/USDT, BNB/USDT,
+XRP/USDT across 5m/15m/1h/4h timeframes, plus live best bid/ask. Public
+Binance Spot endpoints only (ccxt.binance(), no keys, no authentication).
 
 Honest scope note: adaptive spec section 5 states a WebSocket preference.
 This module is REST-primary, not a maintained streaming connection. A
@@ -25,7 +25,14 @@ sys.path.insert(0, ROOT)
 
 from adaptive.cursor import advance, CursorResult  # noqa: E402
 
-SYMBOLS = ("BTC/USDT", "ETH/USDT", "SOL/USDT")
+# Expanded from 3 to 5 symbols (added BNB/USDT, XRP/USDT -- both large-cap,
+# high-liquidity Binance Spot USDT pairs) per explicit user request to
+# increase trade frequency: a bigger universe means more independent
+# chances per cycle for any of the 5 strategies to find a genuine signal,
+# without loosening any strategy's own trigger condition. Each is verified
+# as a real Spot market (not futures/margin) at bootstrap via
+# MarketData.verify_spot_market(), same as the original three.
+SYMBOLS = ("BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT")
 TIMEFRAMES = ("5m", "15m", "1h", "4h")
 TF_MS = {"5m": 300_000, "15m": 900_000, "1h": 3_600_000, "4h": 14_400_000}
 CANDLE_COLUMNS = ["ts", "open", "high", "low", "close", "volume"]

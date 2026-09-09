@@ -37,6 +37,14 @@ adaptive_runtime/research_status.json
 adaptive_runtime/research.log
 adaptive_runtime/research_cache/
 
+# SIMULATED short/margin book runtime (adaptive/short_portfolio.py) --
+# same "regenerated, never source-of-truth" status as the long book's
+# files above; short_trades.csv isn't caught by the trades*.csv pattern
+# above since that only matches names STARTING with "trades".
+adaptive_runtime/short_state.json
+adaptive_runtime/short_trades.csv
+adaptive_runtime/short_decisions.jsonl
+
 # Python
 __pycache__/
 *.pyc

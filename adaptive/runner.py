@@ -76,7 +76,11 @@ SLIPPAGE = 0.0002
 TYPICAL_SPREAD_PCT = 0.02
 PRIMARY_STOP_TF = "5m"
 REGIME_TF = "1h"
-MAX_POSITIONS = 3
+# Matches len(SYMBOLS) (5) -- one concurrent position per symbol, same
+# "one per symbol" design already used for MAX_EXPLORATION_POSITIONS
+# (risk_engine.py). Raised from 3 alongside the symbol-universe expansion
+# so the extra symbols can actually be held concurrently, not just scored.
+MAX_POSITIONS = 5
 POLL_SECONDS = 30
 RETURNS_WINDOW_BARS = 100
 

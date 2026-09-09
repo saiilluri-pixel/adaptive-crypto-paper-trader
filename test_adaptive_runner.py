@@ -334,19 +334,21 @@ def test_multiple_exploration_positions_can_be_held_simultaneously(tmp_path):
 
 
 def test_exploration_capped_at_max_exploration_positions(tmp_path):
-    """A 4th symbol's signal (if there were one) or a 3-symbol universe
-    already at its cap must not exceed MAX_EXPLORATION_POSITIONS -- proven
-    here via the natural 3-symbol ceiling matching the configured cap."""
+    """A signal on EVERY symbol in the universe must never exceed
+    MAX_EXPLORATION_POSITIONS -- written generically against SYMBOLS/
+    MAX_EXPLORATION_POSITIONS rather than a hardcoded count, since the
+    universe size and the cap are configured to match (see
+    market_data.SYMBOLS / risk_engine.MAX_EXPLORATION_POSITIONS) but
+    aren't guaranteed to stay equal forever."""
     from adaptive.risk_engine import MAX_EXPLORATION_POSITIONS
-    assert MAX_EXPLORATION_POSITIONS == 3
     now = BASE + 300 * HOUR
     ex = FakeExchange(now, candles_by_key=_full_candle_set(now))
     runner = AdaptiveRunner(str(tmp_path), market_data=MarketData(exchange=ex))
     runner.bootstrap()
-    for sym in ("BTC/USDT", "ETH/USDT", "SOL/USDT"):
+    for sym in SYMBOLS:
         _fresh_dip_bar(ex, sym, now, "15m")
     runner.run_once_cycle()
-    assert len(runner.exploration_symbols) == MAX_EXPLORATION_POSITIONS
+    assert len(runner.exploration_symbols) == min(len(SYMBOLS), MAX_EXPLORATION_POSITIONS)
 
 
 def test_second_symbol_can_join_exploration_while_first_still_open(tmp_path):

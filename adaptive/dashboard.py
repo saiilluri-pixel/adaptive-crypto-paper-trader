@@ -424,7 +424,10 @@ async function refresh(){
   `;
 
   const market = (p.market)||{};
-  const syms = ['BTC/USDT','ETH/USDT','SOL/USDT'];
+  // derived from the live market snapshot rather than hardcoded, so this
+  // page never needs a manual edit when the trading universe changes
+  // (see adaptive/market_data.py's SYMBOLS)
+  const syms = Object.keys(market);
   document.getElementById('market-cards').innerHTML = syms.map(s=>{
     const m = market[s]||{};
     const spread = m.spread_pct;

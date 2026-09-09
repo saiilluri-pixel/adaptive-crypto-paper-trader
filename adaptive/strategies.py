@@ -60,7 +60,13 @@ class StrategySignal:
 # adaptive/adaptation.py). shock_continuation deliberately has NO tunable
 # params here: it reuses the already-frozen, already-validated shock
 # definition and is excluded from reparameterization by design.
-TREND_DEFAULT_PARAMS = {"z_threshold": 1.0}
+# z_threshold lowered 1.0 -> 0.8 per explicit user request to increase
+# trade frequency -- admits moderately-trending moves that previously
+# needed a full 1x-noise-scale slope to register at all. A live 6.5h
+# sample at the old threshold produced ZERO trend_momentum signals on any
+# of BTC/ETH/SOL, so this was genuinely never firing, not just firing
+# rarely.
+TREND_DEFAULT_PARAMS = {"z_threshold": 0.8}
 
 
 def trend_momentum(df_1h: pd.DataFrame, params: Optional[dict] = None) -> StrategySignal:
@@ -84,7 +90,14 @@ def trend_momentum(df_1h: pd.DataFrame, params: Optional[dict] = None) -> Strate
 
 
 # ── B. Breakout / volatility expansion (primary timeframe: 15m) ────────
-BREAKOUT_DEFAULT_PARAMS = {"n": 20, "volume_percentile": 0.70}
+# volume_percentile lowered 0.70 -> 0.55 per explicit user request to
+# increase trade frequency -- a breakout no longer needs to be in the top
+# 30% of the last 100 bars by volume to qualify, just the top 45%. `n`
+# (the lookback window defining "prior high/low") is left unchanged --
+# this was already the most active of the five strategies live (5 raw
+# signals in 6.5h, the most of any strategy), so only its stricter,
+# easily-adjustable volume gate was loosened, not its core lookback logic.
+BREAKOUT_DEFAULT_PARAMS = {"n": 20, "volume_percentile": 0.55}
 
 
 def volatility_breakout(df_15m: pd.DataFrame, params: Optional[dict] = None) -> StrategySignal:
@@ -117,7 +130,14 @@ def volatility_breakout(df_15m: pd.DataFrame, params: Optional[dict] = None) -> 
 
 
 # ── C. Mean reversion (primary timeframe: 15m) ──────────────────────────
-MEANREV_DEFAULT_PARAMS = {"n": 20, "z_entry": -1.5, "z_exit": 0.0}
+# z_entry loosened -1.5 -> -1.2 per explicit user request to increase
+# trade frequency -- admits a moderately-oversold dip that previously
+# needed a full 1.5-standard-deviation move below the rolling mean.
+# z_exit (take-profit trigger, also the exit_long/bearish-research signal
+# consumed by the SHORT book) is left at 0.0 -- loosening the exit too
+# would shorten every winning trade's runway at the same time entries got
+# easier, working against the goal.
+MEANREV_DEFAULT_PARAMS = {"n": 20, "z_entry": -1.2, "z_exit": 0.0}
 
 
 def mean_reversion(df_15m: pd.DataFrame, params: Optional[dict] = None) -> StrategySignal:

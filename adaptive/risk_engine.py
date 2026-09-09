@@ -49,28 +49,33 @@ STATE_MIN_CONFIDENCE = {
     DegradationState.HALTED: 1.01,
 }
 
-# Paper-exploration sizing (cold-start-deadlock fix): five times smaller
-# than the normal 0.50% risk_per_trade_pct. Capped at MAX_EXPLORATION_POSITIONS
+# Paper-exploration sizing (cold-start-deadlock fix): smaller than the
+# normal 0.50% risk_per_trade_pct. Capped at MAX_EXPLORATION_POSITIONS
 # concurrent exploration positions system-wide -- see size_exploration_entry()
-# and meta_controller.is_exploration_eligible(). Set to 3 (one per symbol,
-# matching MAX_POSITIONS in runner.py) so BTC/ETH/SOL can each independently
-# acquire their first live observation in parallel rather than serially --
-# Portfolio.buy()'s own one-position-per-symbol rule is still the hard
-# ceiling on how many of those 3 slots can ever be occupied at once.
+# and meta_controller.is_exploration_eligible(). Raised from 3 to 5 (one
+# per symbol, matching MAX_POSITIONS in runner.py, now 5 symbols) so each
+# of BTC/ETH/SOL/BNB/XRP can independently acquire its first live
+# observation in parallel rather than serially -- Portfolio.buy()'s own
+# one-position-per-symbol rule is still the hard ceiling on how many of
+# those 5 slots can ever be occupied at once. NOTE: this same constant
+# gates BOTH books independently (adaptive/runner.py tracks
+# exploration_symbols and short_exploration_symbols separately), so the
+# true system-wide ceiling on concurrent exploration positions is now 10
+# (5 long + 5 short), not 5.
 EXPLORATION_RISK_PER_TRADE_PCT = 0.10  # kept as the historical/documented ceiling value
-MAX_EXPLORATION_POSITIONS = 3
+MAX_EXPLORATION_POSITIONS = 5
 
 # Confidence-scaled exploration risk: a signal right at the eligibility
 # floor (MIN_EXPLORATION_SIGNAL_STRENGTH in meta_controller.py) risks the
-# MIN fraction; a maximum-strength (1.0) signal risks the MAX fraction
-# (unchanged from the original flat 0.10% ceiling -- loosening the
-# eligibility floor to admit weaker signals must not also raise the
-# worst-case risk per trade). Chosen when the eligibility floor was
-# lowered from 0.5 to 0.35 in response to real trade-frequency feedback,
-# so that trading more (weaker) signals doesn't mean trading them all at
-# the same size as the strong ones.
-EXPLORATION_RISK_MIN_PCT = 0.05
-EXPLORATION_RISK_MAX_PCT = 0.10
+# MIN fraction; a maximum-strength (1.0) signal risks the MAX fraction.
+# Raised from 0.05/0.10 to 0.08/0.15 per explicit user request to deploy
+# more capital sooner while stats are still cold (cells with zero live
+# trades) -- a deliberate, disclosed increase in per-trade exploration
+# risk, not just trade count. Still well below the normal 0.50%
+# risk_per_trade_pct: exploration positions remain smaller than
+# normally-scored ones even after this increase.
+EXPLORATION_RISK_MIN_PCT = 0.08
+EXPLORATION_RISK_MAX_PCT = 0.15
 
 
 @dataclass

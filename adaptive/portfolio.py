@@ -22,7 +22,10 @@ more conservative still.
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
-SYMBOLS = ("BTC/USDT", "ETH/USDT", "SOL/USDT")
+# Unused within this module (Portfolio is symbol-agnostic) -- kept only as
+# documentation, mirrored from adaptive/market_data.py's SYMBOLS, the
+# actual source of truth for the live trading universe.
+SYMBOLS = ("BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT")
 
 
 @dataclass
