@@ -40,8 +40,19 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+# Promotion criteria tightened 2026-09-22 (spec D2) after the live auto-
+# tuner was observed drifting mean_reversion toward ever-LOOSER, edge-
+# destroying params (z_entry -0.9 -> -0.63 -> -0.44 over 3 days, each a
+# net-negative direction confirmed by a 20-symbol backtest). Two causes:
+# (1) the old PF floor of 1.0 let a challenger promote on merely beating a
+# weak champion by noise, and (2) a 0.6 window-agreement bar tolerated
+# challengers that only "won" on a minority of folds. Raising the absolute
+# PF floor to 1.2 and window-agreement to 0.75 means only challengers with
+# genuine, consistent edge promote -- fewer, more robust promotions. (The
+# deeper fix -- research optimizes on 1h while mean_reversion/breakout run
+# live on 15m -- is tracked separately; this stops the bleeding now.)
 MIN_PROMOTION_SAMPLE = 30
-MIN_WINDOWS_AGREEING_FRAC = 0.6
+MIN_WINDOWS_AGREEING_FRAC = 0.75
 DD_TOLERANCE = 1.2
 MIN_PROMOTION_INTERVAL_SEC = 24 * 3600
 
@@ -111,7 +122,7 @@ def params_hash(params: dict) -> str:
 
 TEST_EXPECTANCY_TOLERANCE_PCT = -0.05  # "not materially negative" -- a small negative
                                         # allowance for noise, not a license for a losing test result
-ABSOLUTE_MIN_PROFIT_FACTOR = 1.0
+ABSOLUTE_MIN_PROFIT_FACTOR = 1.2  # raised 1.0 -> 1.2 (spec D2, see MIN_WINDOWS_AGREEING_FRAC note)
 
 
 def evaluate_promotion(champion: EvaluationResult, challenger: EvaluationResult,

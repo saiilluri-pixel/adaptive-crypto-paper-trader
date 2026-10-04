@@ -25,14 +25,26 @@ sys.path.insert(0, ROOT)
 
 from adaptive.cursor import advance, CursorResult  # noqa: E402
 
-# Expanded from 3 to 5 symbols (added BNB/USDT, XRP/USDT -- both large-cap,
-# high-liquidity Binance Spot USDT pairs) per explicit user request to
-# increase trade frequency: a bigger universe means more independent
-# chances per cycle for any of the 5 strategies to find a genuine signal,
-# without loosening any strategy's own trigger condition. Each is verified
-# as a real Spot market (not futures/margin) at bootstrap via
-# MarketData.verify_spot_market(), same as the original three.
-SYMBOLS = ("BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT")
+# Expanded 3 -> 5 -> 20 symbols. The 5 -> 20 jump (2026-09-18) is the
+# "breadth" lever per Grinold's Fundamental Law (IR ~= IC * sqrt(breadth)):
+# more INDEPENDENT instruments = more quality-adjusted opportunities per
+# cycle WITHOUT loosening any strategy's trigger (that would lower quality
+# per trade; this doesn't). The 15 added pairs were chosen as the most
+# liquid clean Binance Spot USDT markets by 24h quote volume (validated
+# live: MATIC was excluded -- delisted, rebranded POL; TON absent), all
+# re-verified as real Spot markets at bootstrap via verify_spot_market().
+# Cadence note: poll_all() fetches sequentially (~20 symbols x 4 TFs x
+# ~250ms ~= 20s), and the loop is work-then-sleep(POLL_SECONDS), so the
+# effective cycle stretches to ~50s. That is fine -- the cursor.advance()
+# gap-integrity logic pages forward from the last processed bar regardless
+# of wall-clock timing, so no 5m/15m/1h/4h bar is ever skipped; polling a
+# 5m-bar universe every ~50s is still several times per bar.
+SYMBOLS = (
+    "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT",
+    "NEAR/USDT", "UNI/USDT", "ARB/USDT", "DOGE/USDT", "SUI/USDT",
+    "ADA/USDT", "LINK/USDT", "AVAX/USDT", "AAVE/USDT", "TRX/USDT",
+    "LTC/USDT", "APT/USDT", "DOT/USDT", "INJ/USDT", "FIL/USDT",
+)
 TIMEFRAMES = ("5m", "15m", "1h", "4h")
 TF_MS = {"5m": 300_000, "15m": 900_000, "1h": 3_600_000, "4h": 14_400_000}
 CANDLE_COLUMNS = ["ts", "open", "high", "low", "close", "volume"]

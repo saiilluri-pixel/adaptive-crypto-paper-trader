@@ -1,54 +1,81 @@
-# BTC Paper Trading — Prime Swing ⊕ Supertrend ATR (fused)
+# Adaptive Crypto Paper Trader
 
-Simulated futures paper-trading of BTC/USDT against **Binance live public prices**.
-No API keys are used — only public market-data endpoints (`ccxt`). Nothing is ever
-sent to an exchange; all fills, fees and P&L are simulated.
+A research-grade **paper-trading** platform for systematic crypto strategies on Binance,
+built to *honestly* search for a real, out-of-sample trading edge — and to document what
+does and (mostly) does **not** work.
 
-## The fused strategy
-- **Entry — Prime Strategy Swing** (Pine v6 port)
-  - Structure (swing pivots → BOS/CHoCH → trend) on **30m**
-  - Fixed zone with Fibonacci 15/30/50/70/85 levels
-  - Nadaraya-Watson band filter on **5m**
-  - `BUY` / `BUY PRIME` → open **long**; `SELL` / `SELL PRIME` → open **short**
-  - Session / weekday / max-1-per-day gates from the source are **dropped** (24/7 crypto)
-- **Exit — Supertrend ATR w/ Trailing Stop Loss** (Pine v4 port)
-  - Per-position ratcheting trailing stop (initial 3%, tightens after +1% profit)
-  - Close on **trailing-stop hit** OR **Supertrend `direction` flips against the position**
-  - ATR period 1, multiplier 3.0 (source defaults)
-  - Flip-exit arms only *after* the trend confirms the position (`ARM_FLIP_AFTER_ENTRY`)
+> ⚠️ **100% PAPER TRADING. NOT FINANCIAL ADVICE.**
+> This software places **no real orders** and uses **no API keys** — it reads only
+> public Binance market data and simulates fills. Nothing here is a recommendation to
+> buy or sell anything. Crypto trading carries substantial risk of loss. If you adapt
+> this for live trading you do so entirely at your own risk. **No warranty** (see LICENSE).
 
-One position at a time, one equity curve. Defaults: 10,000 USDT, 100% equity/trade,
-0.04% taker fee + 0.02% slippage per fill.
+---
 
-## Files
-| file | role |
+## What this is
+
+- A **single shared-cash paper portfolio**: a Spot-legal long book plus a *simulated*
+  short/margin book, drawing from one capital pool (first-come-first-serve).
+- A **champion/challenger adaptation loop** that walk-forward-tests parameter changes
+  before promoting them, with automatic rollback.
+- **Gap-integrity-safe** market data (a cursor that refuses to skip missing candles).
+- A deterministic **pytest suite** (~260 tests) covering portfolio invariants, risk
+  rules, strategy causality, and safety (asserts *no* auth/order code paths exist).
+- A read-only **dashboard** (`adaptive/dashboard.py`).
+
+Core package: [`adaptive/`](adaptive/) — `runner.py` (loop), `strategies.py`,
+`risk_engine.py`, `portfolio.py` / `short_portfolio.py`, `meta_controller.py`
+(scoring/ranking), `market_data.py`, `research_worker.py` (backtest engine),
+`adaptation.py` + `champion_store.py`, `regime.py`, `trailing.py`, `cursor.py`.
+
+## Honest research findings
+
+This repo's main value is **negative results, rigorously obtained.** On real multi-year
+Binance data with a 0.1% fee + 0.02% slippage model and **causal in-sample / out-of-sample
+splits**, we tested a lot and found no strong alpha. Summary:
+
+| Idea | Verdict (out-of-sample) |
 |---|---|
-| `config.py` | all parameters |
-| `feed.py` | Binance public OHLCV + last price (ccxt, no auth) |
-| `strategy.py` | Prime signal engine + Supertrend/TSL, stateful & non-repainting |
-| `engine.py` | simulated futures portfolio, fills, fees, trade log |
-| `run.py` | live runner (warmup → poll live prices → trade; publishes `state.json`) |
-| `dashboard.py` | live web dashboard (stdlib http server) at http://localhost:8787 |
-| `backtest.py` | replay recent history through the same engine (validation) |
+| TA signals (trend/breakout/mean-reversion/ATR) at 1h/15m | ❌ Overfit — great in-sample (PF 2–3.5), collapsed to PF 0.5–1.0 OOS |
+| Aggressive parameter tuning | ❌ Deepened the overfit; live paper went net-negative |
+| Cross-exchange spread (Binance vs Coinbase) | ❌ Real but ~0.007% — ~100× below the ~0.7% cost to trade it |
+| Funding-rate extreme → reversion (BTC/ETH, ~7yr) | ❌ In-sample only; OOS PF 0.70–0.88, negative expectancy |
+| Cross-sectional / weekly momentum | ⚠️ Unstable; OOS results flipped sign across universes/windows |
+| **Trend-filtered equal-weight basket (SMA200 / 4h / daily)** | ✅ **Kept — as risk management, not alpha** |
 
-## Run
+**The one survivor** — hold each of 5 coins (BTC/ETH/BNB/XRP/SOL) only while its 4h close
+is above its SMA200, equal-weight, else cash — is a **drawdown brake, not an edge**:
+out-of-sample it captured most of the basket's upside while **roughly halving max drawdown**
+(≈34% vs ≈63%) and improving Sharpe, and it turned the 2022 bear from −68% into −28%.
+It will **lag buy-and-hold in strong bulls** by design. See `trend_basket/`.
+
+**Honest takeaway:** price/momentum signals on public candles with retail fees do not
+appear to carry durable edge after costs — the visible-to-everyone signals are competed
+away. Real edges tend to need infrastructure this design can't reach (low-latency
+market-making, derivatives/funding capture at scale, private data). PRs that find
+otherwise — *with out-of-sample proof* — are very welcome.
+
+## Run it
+
 ```bash
-python3 run.py              # live paper trade (runs until Ctrl-C)
-python3 dashboard.py        # web dashboard at http://localhost:8787 (run alongside run.py)
-python3 run.py --warmup     # warm up + one snapshot, then exit
-python3 backtest.py --days 30   # offline validation over recent history
+pip install -r requirements.txt          # pandas, numpy, scipy, ccxt, matplotlib
+python3 -m pytest test_adaptive_*.py -q  # ~260 tests
+python3 adaptive/runner.py               # adaptive paper bot (writes to adaptive_runtime/)
+python3 adaptive/dashboard.py --port 8788
+python3 trend_basket/trend_basket_paper.py 10000   # trend-filtered basket, one daily decision
 ```
 
-## Monitor / stop
-```bash
-open http://localhost:8787  # live web dashboard (auto-refreshes every 3s)
-tail -f paper.log           # live heartbeats + trades
-cat trades.csv              # closed-trade log
-pkill -f run.py             # stop the live trader
-pkill -f dashboard.py       # stop the dashboard
-```
+Runtime output (state, logs, ledgers, the cached OHLCV/funding history) is written under
+`adaptive_runtime/` and `trend_basket/` and is **git-ignored** — it regenerates from the
+public Binance API.
 
-## Validation (30d to 2026-06-19)
-+3.23% vs BTC buy-&-hold −17.83%; 33 trades, 39% win, −5.94% max DD.
-Backtest stops use bar adverse-extreme; the live runner uses real tick prices.
-Backtest `trades.csv` timestamps are run-time (not bar-time); live timestamps are real.
+## Contributing / help find an edge
+
+The backtest harness (`adaptive/research_worker.py`) and the deep-history fetchers make it
+easy to test a hypothesis causally. If you propose a strategy, please include an
+**out-of-sample** result (fit on one window, report on another) and costs — in-sample-only
+numbers are not evidence. Bug fixes and code-quality PRs equally welcome.
+
+## License
+
+MIT — see [LICENSE](LICENSE). Set the copyright holder before you push.

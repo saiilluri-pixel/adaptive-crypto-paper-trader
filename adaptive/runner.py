@@ -34,13 +34,15 @@ ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
 
 from adaptive.market_data import MarketData, SYMBOLS, TIMEFRAMES, TF_MS  # noqa: E402
-from adaptive.portfolio import Portfolio  # noqa: E402
+from adaptive.portfolio import Portfolio, SharedCash  # noqa: E402
 from adaptive.short_portfolio import ShortPortfolio  # noqa: E402
 from adaptive.risk_engine import RiskEngine, RiskLimits, DegradationState, MAX_EXPLORATION_POSITIONS  # noqa: E402
-from adaptive.regime import classify_from_df  # noqa: E402
+from adaptive.regime import classify_from_df, compute_features  # noqa: E402
 from adaptive.strategies import (  # noqa: E402
     trend_momentum, volatility_breakout, mean_reversion, shock_continuation, atr_trailing_stop,
+    cross_sectional_signals,
     TREND_DEFAULT_PARAMS, BREAKOUT_DEFAULT_PARAMS, MEANREV_DEFAULT_PARAMS, ATR_TS_DEFAULT_PARAMS,
+    XSECT_DEFAULT_PARAMS,
 )
 from adaptive.stats_store import StatsStore  # noqa: E402
 from adaptive.champion_store import ChampionStore, ChampionRecord, ChampionCorruptionError  # noqa: E402
@@ -54,22 +56,25 @@ from adaptive.trailing import (  # noqa: E402
 # £2,000 real intended trading capital, converted to USDT-equivalent at the
 # live GBP/USD rate checked 2026-09-08 (1 GBP = 1.3542 USD -- Yahoo
 # Finance/xe.com) -- a ONE-TIME conversion fixed at deployment, not a
-# live/continuously updated FX rate. That £2,000-equivalent (2,708.40
-# USDT) is SPLIT evenly across the two books below, per explicit user
-# confirmation (asked directly: split one £2,000 vs. two separate £2,000
-# pools -- user chose split) -- "we don't have more capital" means total
-# capital across the whole system is £2,000, not £2,000 per book. Paper
-# trading only; no real currency is held or converted.
-_TOTAL_CAPITAL_USDT = 2_708.40
-START_CAPITAL = _TOTAL_CAPITAL_USDT / 2       # Spot long book: 1,354.20
+# live/continuously updated FX rate. Paper trading only; no real currency
+# is held or converted.
+#
+# NOT split between the long and short books (reversed from an earlier
+# 50/50 split, per explicit follow-up user request: "there is no money
+# split between short and long trades, the bot has to trade like first
+# come first serve"). Both books share ONE adaptive.portfolio.SharedCash
+# pool (see TOTAL_CAPITAL_USDT below and AdaptiveRunner.__init__) --
+# whichever book's entry logic finds a qualifying signal FIRST in a given
+# decision cycle draws on the full pool; a later entry attempt (same
+# book or the other one) sees the correspondingly reduced live balance.
+# A static per-book half meant a side with no current opportunities left
+# its capital idle while the other side was artificially capped -- this
+# removes that.
+TOTAL_CAPITAL_USDT = 2_708.40
 
-# SIMULATED SHORT / MARGIN capital (adaptive/short_portfolio.py) -- PAPER
-# ONLY, not a real margin account. The other half of the same split total
-# above, kept in its own ledger/state file (own capital tracking, own
-# risk engine/breakers) purely for structural isolation from the long
-# book -- NOT because it is additional capital beyond the £2,000 total.
-SHORT_START_CAPITAL = _TOTAL_CAPITAL_USDT / 2  # Short book: 1,354.20
-SHORT_LEVERAGE = 2.0  # conservative default -- see short_portfolio.DEFAULT_LEVERAGE
+SHORT_LEVERAGE = 4.0  # raised from 2.0 (conservative default) per explicit
+# user request for aggressive trading -- still simulated/paper only, see
+# short_portfolio.py's module docstring.
 
 FEE_RATE = 0.001       # 0.1% Binance Spot taker, configurable
 SLIPPAGE = 0.0002
@@ -89,11 +94,42 @@ DEFAULT_PARAMS = {
     "volatility_breakout": dict(BREAKOUT_DEFAULT_PARAMS),
     "mean_reversion": dict(MEANREV_DEFAULT_PARAMS),
     "atr_trailing_stop": dict(ATR_TS_DEFAULT_PARAMS),
+    # cross_sectional is a MULTI-symbol strategy computed once per cycle
+    # (see strategies.cross_sectional_signals) -- it gets a BASELINE
+    # champion record like the others, but research_worker.py does NOT
+    # tune it (it is absent from that module's STRATEGY_FNS, whose per-
+    # symbol single-series interface can't express a cross-sectional
+    # ranking), so it stays at these defaults until a cross-sectional
+    # research backtest is added. The research_service rollback checker
+    # skips it too (only PROMOTED records are checked; this stays BASELINE).
+    "cross_sectional": dict(XSECT_DEFAULT_PARAMS),
 }
 
 
 def now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _opp_record(o) -> dict:
+    """Full per-candidate score breakdown for the decision log / dashboard
+    (observability upgrade F1). Every field already exists on the
+    Opportunity dataclass and is computed causally in meta_controller's
+    score_opportunity/score_short_opportunity -- this just surfaces the
+    decomposition (edge, regime fit, robustness, and the friction/
+    uncertainty/drawdown/correlation penalties that were subtracted) so a
+    reader can see WHY a candidate scored as it did, not just the final
+    number. Rounded for log compactness; None-safe."""
+    def r(x, n=6):
+        return round(x, n) if isinstance(x, (int, float)) else x
+    return {
+        "symbol": o.symbol, "strategy": o.strategy, "regime": o.regime,
+        "direction": o.direction, "score": r(o.score),
+        "shrunk_edge": r(o.shrunk_edge), "signal_strength": r(o.signal_strength),
+        "regime_fit": r(o.regime_fit), "robustness": r(o.robustness),
+        "friction_penalty": r(o.friction_penalty), "uncertainty_penalty": r(o.uncertainty_penalty),
+        "drawdown_penalty": r(o.drawdown_penalty), "correlation_penalty": r(o.correlation_penalty),
+        "confidence": r(o.confidence), "is_exploration_eligible": o.is_exploration_eligible,
+    }
 
 
 def now_ms():
@@ -105,7 +141,13 @@ class AdaptiveRunner:
         self.runtime_dir = runtime_dir
         os.makedirs(runtime_dir, exist_ok=True)
         self.md = market_data if market_data is not None else MarketData()
-        self.portfolio = Portfolio(START_CAPITAL)
+        # ONE shared cash pool for BOTH books -- see SharedCash's docstring
+        # and the TOTAL_CAPITAL_USDT comment above. state.json (the long
+        # book's file, via _restore()) is the sole authority for restoring
+        # this balance on restart; _restore_short() does NOT independently
+        # set it (see that method's comment).
+        self.cash_pool = SharedCash(TOTAL_CAPITAL_USDT)
+        self.portfolio = Portfolio(self.cash_pool)
         self.risk_engine = RiskEngine(RiskLimits())
         self.stats_store = StatsStore()
         # Champions are READ-ONLY here -- adaptive/research_service.py (a
@@ -116,8 +158,25 @@ class AdaptiveRunner:
         self.champion_store = ChampionStore(os.path.join(runtime_dir, "champion_state.json"))
         self.champions: Dict[str, ChampionRecord] = {}
         self.champion_load_failed = False
-        self.daily_start_equity = START_CAPITAL
+        self.daily_start_equity = TOTAL_CAPITAL_USDT
         self.trading_day: Optional[str] = None
+        # COMBINED (both books) equity tracking, for DISPLAY/reporting only
+        # (dashboard's top-level Portfolio card) -- deliberately separate
+        # from the long book's self.daily_start_equity/self.trading_day
+        # above and the short book's equivalents below, which continue to
+        # feed each book's OWN, unmerged degradation-state/breaker checks
+        # exactly as before. Once cash is shared, EACH book's own equity()
+        # (cash + its own exposure) still correctly reflects live shared
+        # cash, so per-book equity remains valid for per-book RISK
+        # decisions -- but it is no longer a faithful "how is this book
+        # independently performing" figure, since it moves when the OTHER
+        # book spends shared cash. These combined_* fields exist purely so
+        # the dashboard can show one honest, non-double-counted system
+        # equity/return/drawdown instead of two numbers that both claim to
+        # be authoritative and disagree.
+        self.combined_peak_equity = TOTAL_CAPITAL_USDT
+        self.combined_daily_start_equity = TOTAL_CAPITAL_USDT
+        self.combined_trading_day: Optional[str] = None
         self.consecutive_losses = 0
         self.reconciliation_failed = set()
         # Paper-exploration slots (cold-start-deadlock fix): up to
@@ -133,13 +192,15 @@ class AdaptiveRunner:
         self.log_path = os.path.join(runtime_dir, "paper.log")
         self._init_trades_csv()
 
-        # ── SIMULATED SHORT / MARGIN book -- PAPER ONLY, kept completely
-        # separate from the Spot long portfolio above: own capital, own
-        # risk engine/breakers, own stats_store (short-side empirical
-        # evidence is genuinely different from the long side's), own
-        # exploration slots, own state/trades/decisions files. Never
-        # summed into the Spot portfolio's equity/return figures anywhere.
-        # Champion PARAMETERS are shared (self.champions) since the
+        # ── SIMULATED SHORT / MARGIN book -- PAPER ONLY. Shares self.cash_pool
+        # with the Spot long portfolio above (see TOTAL_CAPITAL_USDT comment
+        # -- no money split, first come first serve) but otherwise stays
+        # structurally separate: own position ledger, own risk engine/
+        # breakers/degradation state (a bad run on one side does NOT halt
+        # or throttle the other -- see run_once_cycle), own stats_store
+        # (short-side empirical evidence is genuinely different from the
+        # long side's), own exploration slots, own state/trades/decisions
+        # files. Champion PARAMETERS are shared (self.champions) since the
         # underlying strategy signal logic is identical -- only which side
         # of each signal gets acted on differs.
         # positional, not leverage=, so this pure-Python simulated-object
@@ -148,10 +209,10 @@ class AdaptiveRunner:
         # a REAL ccxt/exchange setLeverage(...) call -- there is no such
         # call anywhere in this codebase; this just instantiates a plain
         # dataclass-backed paper ledger (see adaptive/short_portfolio.py).
-        self.short_portfolio = ShortPortfolio(SHORT_START_CAPITAL, SHORT_LEVERAGE)
+        self.short_portfolio = ShortPortfolio(self.cash_pool, SHORT_LEVERAGE)
         self.short_risk_engine = RiskEngine(RiskLimits())
         self.short_stats_store = StatsStore()
-        self.short_daily_start_equity = SHORT_START_CAPITAL
+        self.short_daily_start_equity = TOTAL_CAPITAL_USDT
         self.short_trading_day: Optional[str] = None
         self.short_consecutive_losses = 0
         self.short_exploration_symbols: set = set()
@@ -252,6 +313,19 @@ class AdaptiveRunner:
             self.short_trading_day = today
             self.short_daily_start_equity = equity
             self.short_consecutive_losses = 0
+
+    def _roll_combined_day_if_needed(self, equity: float):
+        """DISPLAY-only combined-equity daily rollover -- mirrors the two
+        methods above but feeds nothing risk-relevant (no consecutive-loss
+        counter to reset here; that stays per-book)."""
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if self.combined_trading_day is None:
+            self.combined_trading_day = today
+            self.combined_daily_start_equity = equity
+            return
+        if self.combined_trading_day != today:
+            self.combined_trading_day = today
+            self.combined_daily_start_equity = equity
 
     # ── position management (exits are NEVER blocked) ────────────────
     def _manage_position(self, symbol: str, prices: Dict[str, float]):
@@ -357,10 +431,11 @@ class AdaptiveRunner:
         is responsible for the eligibility filter, the MAX_EXPLORATION_POSITIONS
         cap, and iteration order -- this method just executes a single
         candidate and logs the outcome either way."""
+        combined_heat, combined_exposure = self._combined_heat_and_exposure(prices)
         sizing = self.risk_engine.size_exploration_entry(
             equity=equity, cash=self.portfolio.cash,
-            current_portfolio_heat_usdt=sum(p.risk_amount_usdt for p in self.portfolio.positions.values()),
-            current_crypto_value_usdt=self.portfolio.crypto_value(prices),
+            current_portfolio_heat_usdt=combined_heat,
+            current_crypto_value_usdt=combined_exposure,
             stop_distance_frac=opp.stop_pct / 100.0, confidence=opp.confidence,
             signal_strength=opp.signal_strength)
         if not sizing.approved:
@@ -411,10 +486,11 @@ class AdaptiveRunner:
         (run_once_cycle) is responsible for the eligibility filter, the
         MAX_EXPLORATION_POSITIONS cap, and iteration order -- this method
         just executes a single candidate and logs the outcome either way."""
+        combined_heat, combined_exposure = self._combined_heat_and_exposure(prices)
         sizing = self.short_risk_engine.size_exploration_entry(
             equity=equity, cash=self.short_portfolio.cash,
-            current_portfolio_heat_usdt=sum(p.risk_amount_usdt for p in self.short_portfolio.positions.values()),
-            current_crypto_value_usdt=self.short_portfolio.exposure_value(prices),
+            current_portfolio_heat_usdt=combined_heat,
+            current_crypto_value_usdt=combined_exposure,
             stop_distance_frac=opp.stop_pct / 100.0, confidence=opp.confidence,
             signal_strength=opp.signal_strength)
         if not sizing.approved:
@@ -468,7 +544,24 @@ class AdaptiveRunner:
             self.champion_load_failed = True
         for sym in SYMBOLS:
             for tf in TIMEFRAMES:
-                result = self.md.poll(sym, tf)
+                # A transient exchange error (RequestTimeout/NetworkError/
+                # 5xx) on ANY one of these initial polls must NOT crash the
+                # whole process -- run_forever()'s loop is wrapped in
+                # try/except for exactly this reason, but bootstrap() runs
+                # BEFORE that loop, so without this guard one flaky fetch
+                # here kills the process before it ever reaches steady
+                # state, and launchd's KeepAlive relaunches it straight
+                # into the same failure -> a crash loop. This became likely
+                # once the universe grew to 20 symbols (80 sequential
+                # fetches at startup vs 20). A symbol that fails to warm up
+                # here simply keeps cursor=None and cold-starts on its next
+                # successful poll inside the normal cycle -- no data lost.
+                try:
+                    result = self.md.poll(sym, tf)
+                except Exception as e:
+                    self.log(f"  bootstrap poll {sym}/{tf} failed ({type(e).__name__}: "
+                             f"{str(e)[:120]}) -- will warm up on a later cycle, continuing")
+                    continue
                 held = self.portfolio.held_qty(sym) > 0 or self.short_portfolio.held_qty(sym) > 0
                 if result.gap_detected and tf == PRIMARY_STOP_TF and held:
                     self.reconciliation_failed.add(sym)
@@ -518,6 +611,12 @@ class AdaptiveRunner:
             self.exploration_symbols = {legacy} if legacy else set()
         self.stats_store = StatsStore.from_dict(state.get("stats_store"))
         self.risk_engine.state = DegradationState(state.get("risk_state", "NORMAL"))
+        # COMBINED (system-wide) display state -- see the combined_* fields'
+        # __init__ comment. state.json is the sole authority for these
+        # (short_state.json carries no equivalent keys).
+        self.combined_peak_equity = state.get("combined_peak_equity", self.portfolio.cash)
+        self.combined_daily_start_equity = state.get("combined_daily_start_equity", self.portfolio.cash)
+        self.combined_trading_day = state.get("combined_trading_day")
 
     def _save_state(self):
         state = {
@@ -541,6 +640,9 @@ class AdaptiveRunner:
             "stats_store": self.stats_store.to_dict(),
             "risk_state": self.risk_engine.state.value,
             "market_cursors": {f"{s}|{tf}": ts for (s, tf), ts in self.md.cursors.items()},
+            "combined_peak_equity": self.combined_peak_equity,
+            "combined_daily_start_equity": self.combined_daily_start_equity,
+            "combined_trading_day": self.combined_trading_day,
         }
         tmp = self.state_path + ".tmp"
         with open(tmp, "w") as f:
@@ -563,7 +665,16 @@ class AdaptiveRunner:
     def _restore_short(self, state: dict):
         from adaptive.short_portfolio import ShortPosition
         p = state.get("portfolio", {})
-        self.short_portfolio.cash = p.get("cash", self.short_portfolio.cash)
+        # Deliberately does NOT restore "cash" here -- it's the SAME
+        # shared adaptive.portfolio.SharedCash balance the long book
+        # already restored via _restore(state.json), which bootstrap()
+        # calls first. short_state.json still WRITES its own "cash" value
+        # below (_save_short_state) for human-debug visibility, but it
+        # must never be read back as an independent source of truth: two
+        # files independently restoring the same shared value would let a
+        # stale short_state.json (e.g. from a crash that saved one file
+        # but not the other) silently overwrite the correct long-restored
+        # balance, depending on whatever order bootstrap() calls them in.
         self.short_portfolio.realized_pnl = p.get("realized_pnl", 0.0)
         self.short_portfolio.n_trades = p.get("n_trades", 0)
         self.short_portfolio.wins = p.get("wins", 0)
@@ -643,13 +754,40 @@ class AdaptiveRunner:
     def snapshot(self, prices: Dict[str, float]) -> dict:
         """Section 20 dashboard/status: PORTFOLIO, POSITIONS, AI BRAIN, MARKET."""
         snap = self.portfolio.snapshot(prices)
-        equity = snap["equity"]
-        daily_pnl = equity - self.daily_start_equity
-        heat_usdt = sum(p.risk_amount_usdt for p in self.portfolio.positions.values())
+        # cash/equity/return_pct/drawdown_pct/*_allocation_pct/daily_pnl_*/
+        # portfolio_heat_* below are OVERWRITTEN with COMBINED (both books)
+        # figures, replacing self.portfolio.snapshot()'s long-only versions
+        # -- see _combined_equity()'s docstring for why: once cash is
+        # shared, "the long book's own equity" is no longer a faithful
+        # standalone number (it moves when the SHORT book spends shared
+        # cash too), so showing it as THE top-level Portfolio figure would
+        # misrepresent total system capital. `positions`/`realized_pnl`/
+        # `n_trades`/`wins` below are correctly left as the long book's
+        # OWN (unaffected by cash-sharing, genuinely long-specific).
+        combined_equity = self._combined_equity(prices)
+        combined_heat_usdt, combined_exposure_usdt = self._combined_heat_and_exposure(prices)
+        combined_cash = self.cash_pool.balance
+        daily_pnl = combined_equity - self.combined_daily_start_equity
+
+        snap["cash"] = combined_cash
+        snap["equity"] = combined_equity
+        snap["peak_equity"] = self.combined_peak_equity
+        snap["return_pct"] = (combined_equity / TOTAL_CAPITAL_USDT - 1) * 100 if TOTAL_CAPITAL_USDT else 0.0
+        snap["drawdown_pct"] = ((self.combined_peak_equity - combined_equity) / self.combined_peak_equity * 100
+                                 if self.combined_peak_equity else 0.0)
+        snap["crypto_allocation_pct"] = (self.portfolio.crypto_value(prices) / combined_equity * 100
+                                          if combined_equity else 0.0)
+        snap["cash_allocation_pct"] = (combined_cash / combined_equity * 100) if combined_equity else 0.0
         snap["daily_pnl_usdt"] = daily_pnl
-        snap["daily_pnl_pct"] = (daily_pnl / self.daily_start_equity * 100) if self.daily_start_equity else 0.0
-        snap["portfolio_heat_usdt"] = heat_usdt
-        snap["portfolio_heat_pct"] = (heat_usdt / equity * 100) if equity else 0.0
+        snap["daily_pnl_pct"] = (daily_pnl / self.combined_daily_start_equity * 100
+                                  if self.combined_daily_start_equity else 0.0)
+        snap["portfolio_heat_usdt"] = combined_heat_usdt
+        snap["portfolio_heat_pct"] = (combined_heat_usdt / combined_equity * 100) if combined_equity else 0.0
+        # risk_state/consecutive_losses at the top level remain the LONG
+        # book's OWN -- these are per-book degradation-state concepts
+        # (deliberately NOT merged, see run_once_cycle), unaffected by
+        # cash-sharing the way equity is; short's own values are still
+        # shown under short_book below, unchanged.
         snap["risk_state"] = self.risk_engine.state.value
         snap["risk_state_reason"] = self.risk_engine.state_reason
         snap["consecutive_losses"] = self.consecutive_losses
@@ -684,24 +822,47 @@ class AdaptiveRunner:
         snap["market"] = market
 
         # SIMULATED SHORT / MARGIN book -- PAPER ONLY. Deliberately its own
-        # top-level key, never merged into the Spot `equity`/`daily_pnl_*`
-        # figures above: these are two structurally separate books with
-        # separate capital, and blending them into one "performance" number
-        # would misrepresent both.
+        # top-level key so open short positions, realized short PnL, and
+        # short-specific risk state stay clearly separate from the long
+        # book's own numbers above -- but cash/equity/return_pct/
+        # drawdown_pct/portfolio_heat_* are DELIBERATELY DROPPED here (not
+        # just "not shown," actively removed): ShortPortfolio.snapshot()
+        # computes all of those from cash+exposure, and cash is now the
+        # SAME shared balance the long book also draws from, so a
+        # standalone "Short Book Equity" figure would swing based on the
+        # LONG book's trades too -- see _combined_equity()'s docstring.
+        # The combined figures at the top level (snap["equity"] etc. above)
+        # are the one honest system-wide number; realized_pnl/n_trades/
+        # wins/positions/leverage below remain genuinely short-specific
+        # and are unaffected by cash-sharing, so they stay.
         short_snap = self.short_portfolio.snapshot(prices)
-        short_equity = short_snap["equity"]
-        short_daily_pnl = short_equity - self.short_daily_start_equity
-        short_heat_usdt = sum(p.risk_amount_usdt for p in self.short_portfolio.positions.values())
-        short_snap["daily_pnl_usdt"] = short_daily_pnl
-        short_snap["daily_pnl_pct"] = (
-            short_daily_pnl / self.short_daily_start_equity * 100) if self.short_daily_start_equity else 0.0
-        short_snap["portfolio_heat_usdt"] = short_heat_usdt
-        short_snap["portfolio_heat_pct"] = (short_heat_usdt / short_equity * 100) if short_equity else 0.0
+        for _misleading_key in ("cash", "equity", "start_capital", "return_pct", "peak_equity", "drawdown_pct"):
+            short_snap.pop(_misleading_key, None)
         short_snap["risk_state"] = self.short_risk_engine.state.value
         short_snap["risk_state_reason"] = self.short_risk_engine.state_reason
         short_snap["consecutive_losses"] = self.short_consecutive_losses
         short_snap["leverage"] = self.short_portfolio.leverage
         snap["short_book"] = short_snap
+
+        # All-time REALIZED P&L (banked on closed trades) -- the honest
+        # scorecard, deliberately surfaced at the top level distinct from
+        # equity/return_pct above (which include UNREALIZED marks on open
+        # positions and so flatter/mislead). Combined = long book + short
+        # book, both genuinely realized and unaffected by the shared-cash
+        # display caveats. realized_return_pct is measured against the fixed
+        # starting capital so it is comparable over time regardless of
+        # current open exposure.
+        rl = self.portfolio.realized_pnl
+        rs = self.short_portfolio.realized_pnl
+        tl, ts = self.portfolio.n_trades, self.short_portfolio.n_trades
+        wl, ws = self.portfolio.wins, self.short_portfolio.wins
+        snap["realized_pnl_long"] = rl
+        snap["realized_pnl_short"] = rs
+        snap["realized_pnl_combined"] = rl + rs
+        snap["realized_return_pct"] = (rl + rs) / TOTAL_CAPITAL_USDT * 100 if TOTAL_CAPITAL_USDT else 0.0
+        snap["n_trades_combined"] = tl + ts
+        snap["wins_combined"] = wl + ws
+        snap["win_rate_pct"] = (100.0 * (wl + ws) / (tl + ts)) if (tl + ts) else 0.0
         return snap
 
     def write_dashboard(self, prices: Dict[str, float]):
@@ -750,9 +911,25 @@ class AdaptiveRunner:
         self._roll_day_if_needed(equity)
         short_equity = self.short_portfolio.update_peak_equity(prices)
         self._roll_short_day_if_needed(short_equity)
+        combined_equity = self._combined_equity(prices)
+        self.combined_peak_equity = max(self.combined_peak_equity, combined_equity)
+        self._roll_combined_day_if_needed(combined_equity)
 
-        drawdown_pct = ((self.portfolio.peak_equity - equity) / self.portfolio.peak_equity * 100
-                         if self.portfolio.peak_equity else 0.0)
+        # Degradation/breaker checks for BOTH books use COMBINED equity/
+        # peak/daily-start, NOT each book's own equity() -- once cash is
+        # shared, a book's own equity() moves whenever the OTHER book
+        # merely reserves capital (margin, inventory) with zero realized
+        # loss, which would otherwise trip that book's daily-loss breaker
+        # against its own frozen daily_start_equity for no real reason
+        # (confirmed live: a short-side exploration entry alone produced
+        # a false "daily loss 3.77%" on the long book). Combined equity is
+        # invariant to capital *reservation* and only moves on genuine P&L
+        # (realized or unrealized) on either side, so it is the honest
+        # health figure for both breakers. consecutive_losses/loss_streak
+        # stay per-book on purpose (see run_once_cycle's docstring above) --
+        # only the equity/peak/daily-start INPUTS are shared.
+        drawdown_pct = ((self.combined_peak_equity - combined_equity) / self.combined_peak_equity * 100
+                         if self.combined_peak_equity else 0.0)
         recent_pf, recent_exp = self._recent_aggregate_stats()
         new_state = self.risk_engine.evaluate_degradation(
             drawdown_pct=drawdown_pct, loss_streak=self.consecutive_losses,
@@ -762,14 +939,15 @@ class AdaptiveRunner:
             self.risk_engine.set_state(new_state, "degradation evaluation")
 
         breaker_reason = self.risk_engine.check_breakers(
-            equity=equity, peak_equity=self.portfolio.peak_equity,
-            daily_start_equity=self.daily_start_equity, consecutive_losses=self.consecutive_losses)
+            equity=combined_equity, peak_equity=self.combined_peak_equity,
+            daily_start_equity=self.combined_daily_start_equity, consecutive_losses=self.consecutive_losses)
 
-        # SIMULATED SHORT book: own degradation state + own breakers,
-        # entirely independent of the long book's above -- a bad run on one
-        # side must never halt or throttle the other.
-        short_drawdown_pct = ((self.short_portfolio.peak_equity - short_equity) / self.short_portfolio.peak_equity * 100
-                               if self.short_portfolio.peak_equity else 0.0)
+        # SIMULATED SHORT book: own degradation STATE + own breaker
+        # threshold config, entirely independent of the long book's above
+        # (a bad run on one side must never halt or throttle the other) --
+        # but fed the SAME combined equity/peak/daily-start inputs as the
+        # long book just above, for the identical cash-sharing reason.
+        short_drawdown_pct = drawdown_pct
         short_recent_pf, short_recent_exp = self._recent_aggregate_stats_short()
         new_short_state = self.short_risk_engine.evaluate_degradation(
             drawdown_pct=short_drawdown_pct, loss_streak=self.short_consecutive_losses,
@@ -779,12 +957,30 @@ class AdaptiveRunner:
             self.short_risk_engine.set_state(new_short_state, "degradation evaluation")
 
         short_breaker_reason = self.short_risk_engine.check_breakers(
-            equity=short_equity, peak_equity=self.short_portfolio.peak_equity,
-            daily_start_equity=self.short_daily_start_equity, consecutive_losses=self.short_consecutive_losses)
+            equity=combined_equity, peak_equity=self.combined_peak_equity,
+            daily_start_equity=self.combined_daily_start_equity, consecutive_losses=self.short_consecutive_losses)
 
         candidates = []
         short_candidates = []
         corr_matrix = self._correlation_matrix()
+
+        # Cross-sectional relative-strength signals: computed ONCE here over
+        # the whole universe (not per-symbol), then injected into each
+        # symbol's signals dict below. Uses 1h closes; entries are still
+        # gated per-symbol by fresh_1h in the loop, exactly like the other
+        # 1h strategy (trend_momentum), so no entry ever fires off a stale
+        # bar. feats give it ATR-scaled stops.
+        xsect_closes, xsect_feats = {}, {}
+        for _s in SYMBOLS:
+            _df1h = self.md.candles[(_s, "1h")]
+            if len(_df1h) > 0:
+                xsect_closes[_s] = _df1h["close"].values
+                _f = compute_features(_df1h)
+                if _f is not None:
+                    xsect_feats[_s] = _f
+        xsect_signals = cross_sectional_signals(
+            xsect_closes, xsect_feats, self._get_champion_params("cross_sectional"))
+
         for sym in SYMBOLS:
             if self.portfolio.held_qty(sym) > 0 or sym in self.reconciliation_failed:
                 continue
@@ -811,6 +1007,12 @@ class AdaptiveRunner:
             if len(df_4h) > 0:
                 signals["atr_trailing_stop"] = (atr_trailing_stop(
                     df_4h, self._get_champion_params("atr_trailing_stop")), fresh_4h)
+            if sym in xsect_signals:
+                # 1h-based like trend_momentum -> gated by fresh_1h; a
+                # neutral (direction=None) entry is simply ignored by the
+                # branch dispatch below, so injecting it unconditionally
+                # (when present) is safe.
+                signals["cross_sectional"] = (xsect_signals[sym], fresh_1h)
             if fresh_1h:
                 # shock_continuation is STATEFUL (mutates its detector's
                 # rolling tr_hist/prev_close on every call) -- it must be
@@ -853,10 +1055,9 @@ class AdaptiveRunner:
         selected = rank_and_select(candidates, corr_matrix, max_positions=MAX_POSITIONS, direction="long")
         selected_shorts = rank_and_select(short_candidates, corr_matrix, max_positions=MAX_POSITIONS, direction="short")
         self._log_decision("*", "cycle_ranking", {
-            "candidates": [{"symbol": o.symbol, "strategy": o.strategy, "score": o.score} for o in candidates],
+            "candidates": [_opp_record(o) for o in candidates],
             "selected": [o.symbol for o in selected], "risk_state": self.risk_engine.state.value,
-            "short_candidates": [{"symbol": o.symbol, "strategy": o.strategy, "score": o.score}
-                                  for o in short_candidates],
+            "short_candidates": [_opp_record(o) for o in short_candidates],
             "selected_shorts": [o.symbol for o in selected_shorts],
             "short_risk_state": self.short_risk_engine.state.value,
         })
@@ -867,10 +1068,24 @@ class AdaptiveRunner:
             for opp in selected:
                 if opp.symbol in self.reconciliation_failed:
                     continue
+                # A symbol can legitimately produce multiple long candidates
+                # in one cycle (e.g. trend_momentum AND cross_sectional both
+                # fire on a strong riser), and rank_and_select does NOT dedup
+                # by symbol -- so an earlier iteration this same loop may have
+                # already opened this symbol. Portfolio.buy() would then raise
+                # "already held" and abort the whole cycle. Skip it here (the
+                # first/highest-scored candidate already took the position).
+                if self.portfolio.held_qty(opp.symbol) > 0:
+                    continue
+                # recomputed EVERY iteration (not hoisted above the loop):
+                # an earlier iteration this same loop may have just opened
+                # a position, and the combined figures must reflect that
+                # before sizing the next one.
+                combined_heat, combined_exposure = self._combined_heat_and_exposure(prices)
                 sizing = self.risk_engine.size_entry(
                     equity=equity, cash=self.portfolio.cash,
-                    current_portfolio_heat_usdt=sum(p.risk_amount_usdt for p in self.portfolio.positions.values()),
-                    current_crypto_value_usdt=self.portfolio.crypto_value(prices),
+                    current_portfolio_heat_usdt=combined_heat,
+                    current_crypto_value_usdt=combined_exposure,
                     stop_distance_frac=opp.stop_pct / 100.0, confidence=opp.confidence)
                 if not sizing.approved:
                     self._log_decision(opp.symbol, "rejected_sizing",
@@ -927,6 +1142,12 @@ class AdaptiveRunner:
             for cand in explorable:
                 if len(self.exploration_symbols) >= MAX_EXPLORATION_POSITIONS:
                     break
+                # `explorable` is built ONCE above, so it can contain two
+                # candidates for the same symbol (different strategies). Once
+                # the first opens the position, re-check here so the second
+                # doesn't hit buy()'s "already held" and abort the cycle.
+                if cand.symbol in self.portfolio.positions or cand.symbol in self.exploration_symbols:
+                    continue
                 self._enter_exploration(cand, equity, prices)
 
         # SIMULATED SHORT book: own entry + exploration loop, gated by its
@@ -939,11 +1160,18 @@ class AdaptiveRunner:
             for opp in selected_shorts:
                 if opp.symbol in self.reconciliation_failed:
                     continue
+                # same within-cycle dedup as the long loop -- sell_to_open()
+                # forbids two shorts in one symbol, so skip if an earlier
+                # candidate this cycle already shorted it.
+                if self.short_portfolio.held_qty(opp.symbol) > 0:
+                    continue
+                # recomputed EVERY iteration -- see the matching comment in
+                # the long entry loop above.
+                combined_heat, combined_exposure = self._combined_heat_and_exposure(prices)
                 sizing = self.short_risk_engine.size_entry(
                     equity=short_equity, cash=self.short_portfolio.cash,
-                    current_portfolio_heat_usdt=sum(
-                        p.risk_amount_usdt for p in self.short_portfolio.positions.values()),
-                    current_crypto_value_usdt=self.short_portfolio.exposure_value(prices),
+                    current_portfolio_heat_usdt=combined_heat,
+                    current_crypto_value_usdt=combined_exposure,
                     stop_distance_frac=opp.stop_pct / 100.0, confidence=opp.confidence)
                 if not sizing.approved:
                     self._log_short_decision(opp.symbol, "rejected_short_sizing",
@@ -983,11 +1211,49 @@ class AdaptiveRunner:
             for cand in short_explorable:
                 if len(self.short_exploration_symbols) >= MAX_EXPLORATION_POSITIONS:
                     break
+                # same within-cycle dedup as the long exploration loop above.
+                if cand.symbol in self.short_portfolio.positions or cand.symbol in self.short_exploration_symbols:
+                    continue
                 self._enter_short_exploration(cand, short_equity, prices)
 
         self._save_state()
         self._save_short_state()
         self.write_dashboard(prices)
+
+    def _combined_heat_and_exposure(self, prices: Dict[str, float]):
+        """Portfolio-heat and crypto/short-exposure dollar amounts, SUMMED
+        across BOTH books. Required because both books' risk_engine
+        instances now size against the SAME shared cash pool (see
+        SharedCash) -- if each book's size_entry()/size_exploration_entry()
+        call only saw its OWN heat/exposure, the max_portfolio_heat_pct
+        (1.50%) and max_total_crypto_allocation_pct (90%) caps would each
+        be independently checked against roughly the same equity, letting
+        long AND short each separately consume a FULL 1.50%/90% budget --
+        effectively 3% heat / 180% exposure of one pool, doubling the
+        intended ceiling. Summing here closes that hole: whichever book's
+        entries run first in this cycle (long, then short) correctly
+        shrinks the remaining room the other one sees, exactly mirroring
+        how the shared cash balance itself already behaves."""
+        long_heat = sum(p.risk_amount_usdt for p in self.portfolio.positions.values())
+        short_heat = sum(p.risk_amount_usdt for p in self.short_portfolio.positions.values())
+        long_exposure = self.portfolio.crypto_value(prices)
+        short_exposure = self.short_portfolio.exposure_value(prices)
+        return long_heat + short_heat, long_exposure + short_exposure
+
+    def _combined_equity(self, prices: Dict[str, float]) -> float:
+        """The ONE true system-wide equity figure: shared cash (counted
+        ONCE, not once per book) plus long Spot inventory value plus the
+        short book's reserved margin (collateral, not spent) plus its
+        unrealized P&L. Building this from parts here -- rather than
+        naively summing self.portfolio.equity(prices) +
+        self.short_portfolio.equity(prices) -- avoids double-counting the
+        shared cash, which both of those methods independently include."""
+        long_crypto_value = self.portfolio.crypto_value(prices)
+        short_margin_held = sum(p.margin_reserved for p in self.short_portfolio.positions.values())
+        short_unrealized = sum(
+            self.short_portfolio.unrealized_pnl(sym, prices.get(sym, p.entry_price))
+            for sym, p in self.short_portfolio.positions.items())
+        return self.cash_pool.balance + long_crypto_value + short_margin_held + short_unrealized
 
     def _recent_aggregate_stats(self):
         all_trades = [t for c in self.stats_store.cells.values() for t in c.trades[-20:]]

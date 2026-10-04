@@ -6,6 +6,7 @@ import pytest
 from adaptive.strategies import (
     trend_momentum, volatility_breakout, mean_reversion, shock_continuation,
     atr_trailing_stop, ATR_TS_DEFAULT_PARAMS, _wilder_atr, _shock_detectors,
+    cross_sectional_signals, XSECT_DEFAULT_PARAMS,
 )
 
 BASE = 1_800_000_000_000
@@ -45,12 +46,14 @@ def test_trend_momentum_exits_on_downtrend():
 def test_trend_momentum_params_override_changes_threshold():
     """Proves champion/challenger adaptation (adaptive/adaptation.py) can
     actually change live behavior -- a moderate uptrend that doesn't clear
-    the default z_threshold=1.0 DOES clear a looser challenger threshold."""
+    a strict threshold DOES clear a looser one. Both thresholds are pinned
+    explicitly (not TREND_DEFAULT_PARAMS) so this stays a pure mechanism
+    test, independent of whatever the currently-deployed default is."""
     n = 50
-    closes = [100.0 * (1.0003 ** i) for i in range(n)]  # gentle uptrend, below default z_threshold
-    default_sig = trend_momentum(_df(closes))
+    closes = [100.0 * (1.0003 ** i) for i in range(n)]  # gentle uptrend
+    strict_sig = trend_momentum(_df(closes), params={"z_threshold": 5.0})
     loose_sig = trend_momentum(_df(closes), params={"z_threshold": 0.1})
-    assert default_sig.direction is None
+    assert strict_sig.direction is None
     assert loose_sig.direction == "long"
 
 
@@ -102,9 +105,14 @@ def test_mean_reversion_exits_at_or_above_mean():
 
 
 def test_mean_reversion_flat_when_near_mean():
+    # z_entry pinned explicitly (not MEANREV_DEFAULT_PARAMS) -- this data's
+    # z-score is a fixed property of the series (~-1), so whether it counts
+    # as "near mean" is a property of the threshold, not the data; a strict
+    # threshold here keeps this a pure mechanism test independent of
+    # whatever z_entry is currently deployed.
     n = 25
     closes = [100.0 + (i % 2) * 0.1 for i in range(n)]
-    sig = mean_reversion(_df(closes))
+    sig = mean_reversion(_df(closes), params={"z_entry": -3.0, "z_exit": 0.0})
     assert sig.direction is None
 
 
@@ -233,3 +241,99 @@ def test_wilder_atr_matches_hand_computed_seed_value():
     expected_seed = sum(trs[:period]) / period
     assert atr[period - 1] == pytest.approx(expected_seed)
     assert np.isnan(atr[0]) and np.isnan(atr[1])
+
+
+# ── F. cross-sectional relative strength (multi-symbol) ─────────────────
+def _ramp(mult, n=40, start=100.0):
+    """Monotone geometric series -> constant per-bar return `mult-1`, so its
+    risk-adjusted momentum sign is just sign(mult-1); bigger mult = stronger."""
+    return [start * (mult ** i) for i in range(n)]
+
+
+def test_cross_sectional_longs_strongest_shorts_weakest():
+    params = {"lookback": 20, "top_k": 2, "bottom_k": 2}
+    closes = {
+        "A/USDT": _ramp(1.010),   # strongest riser
+        "B/USDT": _ramp(1.006),
+        "C/USDT": _ramp(1.001),   # middle
+        "D/USDT": _ramp(0.997),
+        "E/USDT": _ramp(0.990),   # weakest faller
+        "F/USDT": _ramp(1.0005),  # middle-ish
+    }
+    sigs = cross_sectional_signals(closes, {}, params)
+    # top_k=2 strongest -> long
+    assert sigs["A/USDT"].direction == "long"
+    assert sigs["B/USDT"].direction == "long"
+    # bottom_k=2 weakest -> exit_long (short-book channel) with bearish strength
+    assert sigs["E/USDT"].direction == "exit_long"
+    assert sigs["D/USDT"].direction == "exit_long"
+    assert sigs["E/USDT"].bearish_research_strength > 0
+    # middle -> neutral
+    assert sigs["C/USDT"].direction is None
+    assert sigs["F/USDT"].direction is None
+    # strongest gets the highest long strength; weakest the highest short strength
+    assert sigs["A/USDT"].strength >= sigs["B/USDT"].strength
+    assert sigs["E/USDT"].bearish_research_strength >= sigs["D/USDT"].bearish_research_strength
+
+
+def test_cross_sectional_quality_filter_never_longs_a_faller():
+    """If the whole universe is falling, the 'strongest' is still negative
+    absolute momentum -- the long-leg quality filter must refuse to long it
+    (but the weakest still get shorted)."""
+    params = {"lookback": 20, "top_k": 2, "bottom_k": 2}
+    closes = {
+        "A/USDT": _ramp(0.999),   # least-bad faller
+        "B/USDT": _ramp(0.997),
+        "C/USDT": _ramp(0.995),
+        "D/USDT": _ramp(0.990),   # worst
+    }
+    sigs = cross_sectional_signals(closes, {}, params)
+    assert sigs["A/USDT"].direction is None      # NOT long -- it's still falling
+    assert sigs["D/USDT"].direction == "exit_long"  # worst still shorted
+
+
+def test_cross_sectional_insufficient_history_is_neutral_not_error():
+    params = {"lookback": 30, "top_k": 2, "bottom_k": 2}
+    closes = {
+        "A/USDT": _ramp(1.01, n=10),   # only 10 bars < lookback+1
+        "B/USDT": _ramp(0.99, n=10),
+        "C/USDT": _ramp(1.00, n=10),
+    }
+    sigs = cross_sectional_signals(closes, {}, params)
+    assert all(s.direction is None for s in sigs.values())  # nothing ranked, no crash
+
+
+def test_cross_sectional_too_few_symbols_returns_all_neutral():
+    params = {"lookback": 10, "top_k": 2, "bottom_k": 2}  # needs >=4 ranked
+    closes = {"A/USDT": _ramp(1.01, n=20), "B/USDT": _ramp(0.99, n=20)}  # only 2
+    sigs = cross_sectional_signals(closes, {}, params)
+    assert all(s.direction is None for s in sigs.values())
+
+
+def test_cross_sectional_default_params_present():
+    assert set(XSECT_DEFAULT_PARAMS) == {"lookback", "top_k", "bottom_k"}
+
+
+def test_mean_reversion_shorts_overbought_spike():
+    """Symmetric short leg: a strongly OVERBOUGHT spike (z >= |z_entry|)
+    must emit exit_long WITH bearish_research_strength (the short-book
+    channel) and a real ATR-scaled stop -- previously it only ever emitted
+    a strengthless take-profit exit, contributing zero short candidates."""
+    n = 25
+    closes = [100.0] * (n - 1) + [112.0]  # sharp spike well above the rolling mean
+    sig = mean_reversion(_df(closes))
+    assert sig.direction == "exit_long"
+    assert sig.bearish_research_strength > 0
+    assert sig.stop_pct > 0  # real stop for the short, not the 2.0% fallback
+
+
+def test_mean_reversion_mild_reversion_is_plain_exit_no_short():
+    """A modest move back above the mean (z_exit <= z < |z_entry|) is a
+    take-profit exit for an existing long, NOT a short signal -- we don't
+    short a merely-back-to-mean move."""
+    base = [96, 98, 100, 102, 104, 100, 98, 102, 100, 101,
+            99, 103, 97, 101, 100, 102, 98, 100, 101, 100]  # spread, std ~2.2
+    closes = base + [101.5]  # 21 bars; last modestly above mean -> z ~0.6
+    sig = mean_reversion(_df(closes))
+    assert sig.direction == "exit_long"
+    assert sig.bearish_research_strength == 0.0

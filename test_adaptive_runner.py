@@ -407,8 +407,10 @@ def test_normal_risk_limits_override_exploration(tmp_path):
     ex = FakeExchange(now, candles_by_key=_full_candle_set(now))
     runner = AdaptiveRunner(str(tmp_path), market_data=MarketData(exchange=ex))
     runner.bootstrap()
-    runner.consecutive_losses = 5  # >= CONSECUTIVE_LOSS_BREAKER -- both the
-    # breaker check AND evaluate_degradation() independently see this and HALT
+    # References the live breaker threshold rather than hardcoding it --
+    # both the breaker check AND evaluate_degradation() independently see
+    # this and HALT.
+    runner.consecutive_losses = runner.risk_engine.limits.consecutive_loss_breaker
 
     _btc_oversold_dip_bar(ex, now)
     runner.run_once_cycle()
@@ -569,3 +571,159 @@ def test_shock_continuation_not_double_counted_across_stale_cycles(tmp_path):
     # since fresh_1h is False every cycle here)
     assert "BTC/USDT" not in _shock_detectors or len(
         _shock_detectors.get("BTC/USDT", type("x", (), {"tr_hist": []})()).tr_hist) <= 14
+
+
+# ── cross-sectional relative strength (multi-symbol strategy) ───────────
+def _dispersed_1h(now_ms, risers, fallers, riser_mult=1.004, faller_mult=0.996, n=200):
+    """A full candle set where `risers` trend up and `fallers` trend down on
+    1h, everything else flat. A small deterministic ±0.3% wiggle is layered
+    on so per-bar return volatility is > 0 (a pure geometric series has zero
+    return-vol and is excluded from the cross-sectional ranking by design)."""
+    candles = _full_candle_set(now_ms, price=100.0)
+    tf = TF_MS["1h"]
+    last_close = now_ms - (now_ms % tf) - tf
+    ts0 = last_close - (n - 1) * tf
+
+    def series(mult):
+        out = []
+        for i in range(n):
+            wig = 1.0 + 0.003 * (1 if i % 2 else -1)
+            px = 100.0 * (mult ** i) * wig
+            out.append([ts0 + i * tf, px, px * 1.002, px * 0.998, px, 100.0])
+        return out
+
+    for s in risers:
+        candles[(s, "1h")] = series(riser_mult)
+    for s in fallers:
+        candles[(s, "1h")] = series(faller_mult)
+    return candles
+
+
+def _refresh_1h_and_5m(ex, sym, now_ms, new_now, mult):
+    """Append a fresh 1h bar for `sym` and fill its 5m series up to new_now
+    so market_quality's 5m-staleness gate passes (mirrors _fresh_dip_bar)."""
+    a = list(ex.candles_by_key[(sym, "1h")])
+    lc = a[-1][4]
+    nc = lc * mult
+    a.append([a[-1][0] + TF_MS["1h"], lc, nc * 1.002, lc * 0.998, nc, 500.0])
+    ex.candles_by_key[(sym, "1h")] = a
+    m = list(ex.candles_by_key[(sym, "5m")])
+    t = m[-1][0] + TF_MS["5m"]
+    while t + TF_MS["5m"] <= new_now:
+        m.append([t, nc, nc * 1.001, nc * 0.999, nc, 100.0])
+        t += TF_MS["5m"]
+    ex.candles_by_key[(sym, "5m")] = m
+    ex.tickers[sym] = {"bid": nc * 0.9998, "ask": nc * 1.0002}
+
+
+def test_cross_sectional_reaches_candidate_pool_both_sides(tmp_path):
+    """Regression for the cross-sectional strategy wiring AND the multi-
+    candidate-per-symbol dedup bug it surfaced. With a genuinely dispersed
+    universe (unlike the flat _full_candle_set), the strongest riser must
+    produce a `cross_sectional` LONG candidate and the weakest faller a
+    `cross_sectional` SHORT candidate -- and the cycle must NOT crash when a
+    symbol is flagged by two strategies at once (trend_momentum AND
+    cross_sectional both fire), which previously raised 'already held'."""
+    import json
+    now = BASE + 300 * HOUR
+    risers = list(SYMBOLS[:3])
+    fallers = list(SYMBOLS[3:6])
+    candles = _dispersed_1h(now, risers, fallers)
+    ex = FakeExchange(now, candles_by_key=candles)
+    runner = AdaptiveRunner(str(tmp_path), market_data=MarketData(exchange=ex))
+    runner.bootstrap()
+
+    new_now = now + HOUR
+    ex._now_ms = new_now
+    _refresh_1h_and_5m(ex, risers[0], now, new_now, 1.004)   # strongest riser
+    _refresh_1h_and_5m(ex, fallers[0], now, new_now, 0.996)  # weakest faller
+
+    runner.run_once_cycle()  # must not raise
+
+    lines = [json.loads(l) for l in open(runner.decisions_path)]
+    ev = [l for l in lines if l.get("action") == "cycle_ranking"][-1]
+    long_strats = {(c["symbol"], c["strategy"]) for c in ev["candidates"]}
+    short_strats = {(c["symbol"], c["strategy"]) for c in ev.get("short_candidates", [])}
+    assert (risers[0], "cross_sectional") in long_strats
+    assert (fallers[0], "cross_sectional") in short_strats
+    # the symbol was flagged by BOTH trend_momentum and cross_sectional; the
+    # dedup guard means exactly one position exists, not a crash / double buy
+    assert runner.portfolio.held_qty(risers[0]) > 0
+    assert runner.short_portfolio.held_qty(fallers[0]) > 0
+
+
+def test_bootstrap_survives_transient_fetch_error(tmp_path):
+    """Regression: a transient exchange error on ONE (symbol, timeframe)
+    poll during bootstrap must not crash the process (bootstrap runs before
+    run_forever's try/except, so an unhandled raise here -> launchd crash
+    loop). Became likely once the universe grew to 20 symbols = 80 startup
+    fetches. The failing symbol just warms up on a later cycle."""
+    now = BASE + 300 * HOUR
+
+    class FlakyExchange(FakeExchange):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.raised = False
+
+        def fetch_ohlcv(self, symbol, timeframe, since=None, limit=500):
+            if symbol == SYMBOLS[7] and timeframe == "1h" and not self.raised:
+                self.raised = True
+                import ccxt
+                raise ccxt.RequestTimeout(f"simulated timeout {symbol} {timeframe}")
+            return super().fetch_ohlcv(symbol, timeframe, since=since, limit=limit)
+
+    ex = FlakyExchange(now, candles_by_key=_full_candle_set(now))
+    runner = AdaptiveRunner(str(tmp_path), market_data=MarketData(exchange=ex))
+    runner.bootstrap()  # must NOT raise
+    assert ex.raised
+    assert len(runner.md.candles[(SYMBOLS[0], "1h")]) > 0
+
+
+def test_cycle_ranking_logs_full_score_breakdown(tmp_path):
+    """Observability upgrade F1: each cycle_ranking event must carry the full
+    per-candidate score decomposition (edge, regime fit, robustness, and the
+    friction/uncertainty/drawdown/correlation penalties), not just
+    symbol/strategy/score -- so 'is this more profitable' can actually be
+    inspected. Reuses the dispersed-universe fixture that reliably produces
+    both long and short candidates."""
+    import json
+    now = BASE + 300 * HOUR
+    risers = list(SYMBOLS[:3]); fallers = list(SYMBOLS[3:6])
+    candles = _dispersed_1h(now, risers, fallers)
+    ex = FakeExchange(now, candles_by_key=candles)
+    runner = AdaptiveRunner(str(tmp_path), market_data=MarketData(exchange=ex))
+    runner.bootstrap()
+    new_now = now + HOUR; ex._now_ms = new_now
+    _refresh_1h_and_5m(ex, risers[0], now, new_now, 1.004)
+    _refresh_1h_and_5m(ex, fallers[0], now, new_now, 0.996)
+    runner.run_once_cycle()
+
+    ev = [json.loads(l) for l in open(runner.decisions_path) if json.loads(l).get("action") == "cycle_ranking"][-1]
+    assert ev["candidates"], "expected at least one long candidate"
+    required = {"symbol", "strategy", "regime", "direction", "score", "shrunk_edge",
+                "signal_strength", "regime_fit", "robustness", "friction_penalty",
+                "uncertainty_penalty", "drawdown_penalty", "correlation_penalty",
+                "confidence", "is_exploration_eligible"}
+    for c in ev["candidates"] + ev["short_candidates"]:
+        assert required.issubset(c.keys()), f"missing breakdown fields: {required - set(c.keys())}"
+
+
+def test_snapshot_exposes_combined_realized_pnl(tmp_path):
+    """All-time realized P&L (the honest banked scorecard) must be surfaced
+    at the top level of the snapshot, distinct from equity/return (which
+    include unrealized marks). Combined = long + short realized."""
+    now = BASE + 300 * HOUR
+    ex = FakeExchange(now, candles_by_key=_full_candle_set(now))
+    runner = AdaptiveRunner(str(tmp_path), market_data=MarketData(exchange=ex))
+    runner.bootstrap()
+    runner.portfolio.realized_pnl = -32.42
+    runner.short_portfolio.realized_pnl = -21.35
+    runner.portfolio.n_trades = 20; runner.portfolio.wins = 3
+    runner.short_portfolio.n_trades = 14; runner.short_portfolio.wins = 3
+    snap = runner.snapshot({s: 100.0 for s in SYMBOLS})
+    assert snap["realized_pnl_long"] == pytest.approx(-32.42)
+    assert snap["realized_pnl_short"] == pytest.approx(-21.35)
+    assert snap["realized_pnl_combined"] == pytest.approx(-53.77)
+    assert snap["n_trades_combined"] == 34
+    assert snap["wins_combined"] == 6
+    assert snap["win_rate_pct"] == pytest.approx(100 * 6 / 34)

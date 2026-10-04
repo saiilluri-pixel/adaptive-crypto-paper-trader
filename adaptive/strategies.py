@@ -60,13 +60,13 @@ class StrategySignal:
 # adaptive/adaptation.py). shock_continuation deliberately has NO tunable
 # params here: it reuses the already-frozen, already-validated shock
 # definition and is excluded from reparameterization by design.
-# z_threshold lowered 1.0 -> 0.8 per explicit user request to increase
-# trade frequency -- admits moderately-trending moves that previously
-# needed a full 1x-noise-scale slope to register at all. A live 6.5h
-# sample at the old threshold produced ZERO trend_momentum signals on any
-# of BTC/ETH/SOL, so this was genuinely never firing, not just firing
-# rarely.
-TREND_DEFAULT_PARAMS = {"z_threshold": 0.8}
+# z_threshold lowered 1.0 -> 0.8 -> 0.5 (the latter per explicit user
+# request for aggressive trading) -- admits moderately-trending moves that
+# previously needed a full 1x-noise-scale slope to register at all. A live
+# 6.5h sample at the original 1.0 threshold produced ZERO trend_momentum
+# signals on any of BTC/ETH/SOL, so this was genuinely never firing, not
+# just firing rarely.
+TREND_DEFAULT_PARAMS = {"z_threshold": 0.5}
 
 
 def trend_momentum(df_1h: pd.DataFrame, params: Optional[dict] = None) -> StrategySignal:
@@ -90,14 +90,14 @@ def trend_momentum(df_1h: pd.DataFrame, params: Optional[dict] = None) -> Strate
 
 
 # ── B. Breakout / volatility expansion (primary timeframe: 15m) ────────
-# volume_percentile lowered 0.70 -> 0.55 per explicit user request to
-# increase trade frequency -- a breakout no longer needs to be in the top
-# 30% of the last 100 bars by volume to qualify, just the top 45%. `n`
-# (the lookback window defining "prior high/low") is left unchanged --
-# this was already the most active of the five strategies live (5 raw
-# signals in 6.5h, the most of any strategy), so only its stricter,
-# easily-adjustable volume gate was loosened, not its core lookback logic.
-BREAKOUT_DEFAULT_PARAMS = {"n": 20, "volume_percentile": 0.55}
+# volume_percentile lowered 0.70 -> 0.55 -> 0.40 (the latter per explicit
+# user request for aggressive trading) -- a breakout no longer needs to be
+# in the top 30% of the last 100 bars by volume to qualify, just the top
+# 60%. `n` (the lookback window defining "prior high/low") is left
+# unchanged -- this was already the most active of the five strategies
+# live, so only its easily-adjustable volume gate was loosened further,
+# not its core lookback logic.
+BREAKOUT_DEFAULT_PARAMS = {"n": 20, "volume_percentile": 0.40}
 
 
 def volatility_breakout(df_15m: pd.DataFrame, params: Optional[dict] = None) -> StrategySignal:
@@ -130,14 +130,30 @@ def volatility_breakout(df_15m: pd.DataFrame, params: Optional[dict] = None) -> 
 
 
 # ── C. Mean reversion (primary timeframe: 15m) ──────────────────────────
-# z_entry loosened -1.5 -> -1.2 per explicit user request to increase
-# trade frequency -- admits a moderately-oversold dip that previously
-# needed a full 1.5-standard-deviation move below the rolling mean.
-# z_exit (take-profit trigger, also the exit_long/bearish-research signal
-# consumed by the SHORT book) is left at 0.0 -- loosening the exit too
-# would shorten every winning trade's runway at the same time entries got
-# easier, working against the goal.
-MEANREV_DEFAULT_PARAMS = {"n": 20, "z_entry": -1.2, "z_exit": 0.0}
+# z_entry history: -1.5 -> -1.2 -> -0.9 (loosened for "aggressive"
+# trading) -> REVERTED to -1.5 (2026-09-22). A backtest across all 20
+# symbols on the LIVE 15m timeframe (fee+slippage inclusive) showed the
+# aggressive loosening actively destroyed this strategy's edge: at -0.9 it
+# was PF 1.04 / +8% (and PF 0.89 / -52% on 1h), the single largest source
+# of live trades yet a net drag on the book. -1.5 is the empirical sweet
+# spot on 15m (PF 1.08, +13%, ~30% fewer trades) -- fewer, higher-quality
+# dips, less fee churn, less DEFENSIVE-state noise. The dramatic 1h
+# improvement from tightening further (PF 2.09 at -2.5) does NOT transfer
+# to the 15m timeframe this strategy actually trades on, so -1.5 (not -2.5)
+# is the honest choice. z_exit (take-profit for an existing long) stays 0.0.
+#
+# Symmetric SHORT leg added 2026-09-20 (per explicit user request "why
+# aren't we short trading"): this strategy was the single largest source of
+# LONG candidates (dip-buying) but produced ZERO short candidates, because
+# its overbought exit carried no bearish_research_strength -- so it never
+# fed the SHORT book. It now mirrors the long leg: an OVERBOUGHT spike
+# (z >= |z_entry|) emits direction="exit_long" WITH a bearish_research_
+# strength, which is exactly the Spot-legal channel score_short_opportunity
+# consumes as a short-entry signal (the exit_long also correctly closes any
+# existing long in that symbol). A milder reversion (z_exit <= z < |z_entry|)
+# still emits a plain take-profit exit_long with no bearish strength, so it
+# closes longs without triggering a short on a merely-back-to-mean move.
+MEANREV_DEFAULT_PARAMS = {"n": 20, "z_entry": -1.5, "z_exit": 0.0}
 
 
 def mean_reversion(df_15m: pd.DataFrame, params: Optional[dict] = None) -> StrategySignal:
@@ -154,16 +170,120 @@ def mean_reversion(df_15m: pd.DataFrame, params: Optional[dict] = None) -> Strat
         return StrategySignal("mean_reversion", None, 0.0, 0.0, 0.0, "n/a", ["RANGE", "LOW_VOLATILITY"])
     last = float(closes.iloc[-1])
     z = (last - mean) / std
+    z_short = abs(p["z_entry"])  # symmetric overbought threshold (e.g. +0.9)
     if z <= p["z_entry"]:
         strength = float(np.clip(-z / 3.0, 0.0, 1.0))
         return StrategySignal("mean_reversion", "long", strength, expected_rr=1.2,
                                stop_pct=max(1.0, feat.atr_pct_of_price * 200),
                                exit_plan="exit as price reverts to the rolling mean",
                                regime_compatibility=["RANGE", "LOW_VOLATILITY"])
+    if z >= z_short:
+        # overbought -> exit any long AND a bearish short-entry candidate
+        bearish = float(np.clip(z / 3.0, 0.0, 1.0))
+        return StrategySignal("mean_reversion", "exit_long", 0.0, expected_rr=1.2,
+                               stop_pct=max(1.0, feat.atr_pct_of_price * 200),
+                               exit_plan="overbought -- exit long / candidate short",
+                               regime_compatibility=["RANGE", "LOW_VOLATILITY"],
+                               bearish_research_strength=bearish)
     if z >= p["z_exit"]:
         return StrategySignal("mean_reversion", "exit_long", 0.0, 0.0, 0.0,
                                "reverted to mean -- take profit", ["RANGE", "LOW_VOLATILITY"])
     return StrategySignal("mean_reversion", None, 0.0, 0.0, 0.0, "n/a", ["RANGE", "LOW_VOLATILITY"])
+
+
+# ── F. Cross-sectional relative strength (MULTI-symbol, primary tf: 1h) ─
+# The "breadth" alpha (Grinold's Fundamental Law, IR ~= IC * sqrt(breadth)).
+# Unlike A-E, which each judge ONE series against an absolute threshold,
+# this ranks the WHOLE universe against ITSELF each cycle by risk-adjusted
+# trailing momentum (trailing return / realized vol) and takes the cross-
+# sectional extremes: long the strongest top_k, short the weakest bottom_k
+# (the short leg via direction="exit_long" + bearish_research_strength, the
+# same Spot-legal channel every other strategy already feeds the SHORT book
+# through -- see module docstring). This is genuinely ORTHOGONAL to A-E: in
+# a market drifting mildly up with no absolute breakout anywhere it still
+# expresses a relative view, and in a broad selloff it shorts the weakest
+# rather than going flat. Adapted to the live intraday loop from
+# research/cross_sectional_momentum.py's daily/weekly backtest hypothesis.
+#
+# Quality filter: the long leg additionally requires POSITIVE absolute
+# risk-adjusted momentum and the short leg NEGATIVE -- so this never longs
+# the "least bad" faller in a crash nor shorts the "least good" riser in a
+# melt-up. That trades a little market-neutral purity for robustness, which
+# is the right call here since the two books share one pool (FCFS) and are
+# not beta-hedged.
+XSECT_DEFAULT_PARAMS = {"lookback": 24, "top_k": 3, "bottom_k": 3}
+
+
+def _xsect_neutral() -> StrategySignal:
+    return StrategySignal("cross_sectional", None, 0.0, 0.0, 0.0, "n/a",
+                          ["TREND_UP", "TREND_DOWN", "RANGE", "HIGH_VOLATILITY", "LOW_VOLATILITY"])
+
+
+def cross_sectional_signals(closes_by_symbol: Dict[str, object],
+                            feats_by_symbol: Optional[Dict[str, object]] = None,
+                            params: Optional[dict] = None) -> Dict[str, StrategySignal]:
+    """Computed ONCE per cycle over the whole universe (not per-symbol like
+    A-E). closes_by_symbol maps symbol -> 1D array/Series of 1h closes
+    (oldest->newest). Returns a signal for EVERY input symbol: "long" for
+    the top_k strongest, "exit_long"+bearish for the bottom_k weakest, and
+    a neutral (direction=None) signal for everything in between and for any
+    symbol with insufficient history -- so the caller can inject it into
+    the per-symbol signals dict unconditionally, exactly like A-E.
+
+    Ranking metric per symbol: total return over `lookback` bars divided by
+    that window's per-bar return volatility (risk-adjusted momentum),
+    sqrt(lookback)-scaled so it is comparable across symbols. Symbols with
+    <lookback+1 bars or zero volatility are excluded from the ranking (never
+    ranked on missing/degenerate data)."""
+    p = {**XSECT_DEFAULT_PARAMS, **(params or {})}
+    lookback = int(p["lookback"])
+    top_k = int(p["top_k"])
+    bottom_k = int(p["bottom_k"])
+    feats_by_symbol = feats_by_symbol or {}
+    compat = ["TREND_UP", "TREND_DOWN", "RANGE", "HIGH_VOLATILITY", "LOW_VOLATILITY"]
+
+    out = {sym: _xsect_neutral() for sym in closes_by_symbol}
+
+    raw = {}
+    for sym, closes in closes_by_symbol.items():
+        c = np.asarray(closes, dtype=float)
+        if len(c) < lookback + 1:
+            continue
+        w = c[-(lookback + 1):]
+        rets = np.diff(w) / w[:-1]
+        vol = float(np.std(rets))
+        if vol <= 0 or not np.isfinite(vol):
+            continue
+        total_ret = w[-1] / w[0] - 1.0
+        raw[sym] = total_ret / (vol * np.sqrt(lookback))
+
+    n = len(raw)
+    if n < top_k + bottom_k:
+        return out  # not enough ranked symbols to form both extremes without overlap
+
+    order = sorted(raw, key=raw.get)   # weakest -> strongest
+    strongest = order[-top_k:]
+    weakest = order[:bottom_k]
+
+    for i, sym in enumerate(strongest):     # i=0 weakest-of-strong .. i=top_k-1 strongest
+        if raw[sym] <= 0:
+            continue                        # quality filter: never long a faller
+        strength = float(np.clip(0.4 + 0.6 * (i + 1) / top_k, 0.0, 1.0))
+        feat = feats_by_symbol.get(sym)
+        stop_pct = max(1.5, feat.atr_pct_of_price * 200) if feat is not None else 3.0
+        out[sym] = StrategySignal("cross_sectional", "long", strength, expected_rr=1.5,
+                                  stop_pct=stop_pct,
+                                  exit_plan="hold while top-ranked by relative strength, ATR trail",
+                                  regime_compatibility=compat)
+
+    for i, sym in enumerate(weakest):       # i=0 absolute weakest .. i=bottom_k-1 least weak
+        if raw[sym] >= 0:
+            continue                        # quality filter: never short a riser
+        bearish = float(np.clip(0.4 + 0.6 * (bottom_k - i) / bottom_k, 0.0, 1.0))
+        out[sym] = StrategySignal("cross_sectional", "exit_long", 0.0, 0.0, 0.0,
+                                  "relative weakness -- exit long / candidate short", compat,
+                                  bearish_research_strength=bearish)
+    return out
 
 
 # ── D. Shock continuation (primary timeframe: 1h) -- frozen, validated ─
@@ -216,7 +336,14 @@ def shock_continuation(symbol: str, df_1h: pd.DataFrame) -> StrategySignal:
 # strategies use, filling out the multi-timeframe coverage the adaptive
 # spec originally called for (5m execution / 15m tactical / 1h regime /
 # 4h context).
-ATR_TS_DEFAULT_PARAMS = {"atr_period": 5, "hhv_period": 10, "mult": 2.5, "warmup_bars": 16}
+# mult raised 2.5 -> 3.0 (2026-09-22): a 20-symbol backtest on the live 4h
+# timeframe (fee+slippage inclusive) showed a wider ATR trailing band is
+# strictly better here -- mult 3.0 gave PF 1.81 / +403% vs 2.5's PF 1.49 /
+# +381%, with FEWER trades (281 vs 442). A wider band whipsaws less, so it
+# both raises profit factor and cuts fee churn. Going wider still (3.5) lifts
+# PF further but starts trimming return, so 3.0 is the robust knee, not the
+# lone in-sample spike. atr_period/hhv_period/warmup unchanged.
+ATR_TS_DEFAULT_PARAMS = {"atr_period": 5, "hhv_period": 10, "mult": 3.0, "warmup_bars": 16}
 
 
 def _wilder_atr(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, period: int) -> np.ndarray:

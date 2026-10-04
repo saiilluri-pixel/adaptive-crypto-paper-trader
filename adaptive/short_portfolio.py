@@ -11,11 +11,17 @@ leverage, no real money, ever. It is never wired to any authenticated
 endpoint or order-placement code path (see test_adaptive_safety.py, which
 scans this file too).
 
-Kept structurally separate from Portfolio on purpose (own capital, own
-state file, own decision log, own dashboard section, own risk engine
-instance in runner.py) so the Spot long book and this simulated short book
-can never be confused with each other or silently blended into one
-"performance" figure.
+Kept structurally separate from Portfolio on purpose (own position
+ledger, own state file, own decision log, own dashboard section, own risk
+engine instance in runner.py) so the Spot long book and this simulated
+short book can never be confused with each other or silently blended
+into one "performance" figure. As of the shared-capital redesign (per
+explicit user request -- "no money split between short and long
+trades... first come first serve"), CASH is the one exception: both
+books' `cash` reads/writes the SAME adaptive.portfolio.SharedCash
+balance (see runner.py), so whichever book's entry logic finds a
+qualifying signal first draws on the full pool rather than a static
+pre-partitioned half.
 
 Margin mechanics (simplified, disclosed approximations -- not fetched from
 any real lending-rate or margin-schedule data source):
@@ -26,8 +32,16 @@ any real lending-rate or margin-schedule data source):
   - A simple flat daily borrow-cost approximation is charged for the
     holding period, deducted at close.
 """
+import os
+import sys
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+sys.path.insert(0, ROOT)
+
+from adaptive.portfolio import SharedCash  # noqa: E402
 
 DEFAULT_LEVERAGE = 2.0
 MAINTENANCE_BUFFER = 0.8   # liquidate at 80% of the theoretical full-margin-loss move
@@ -55,16 +69,33 @@ class ShortPosition:
 
 
 class ShortPortfolio:
-    def __init__(self, start_capital_usdt: float, leverage: float = DEFAULT_LEVERAGE):
-        self.cash = start_capital_usdt
-        self.start_capital = start_capital_usdt
+    def __init__(self, start_capital_or_pool: Union[float, SharedCash], leverage: float = DEFAULT_LEVERAGE):
+        """Accepts either a plain float (this book gets its own private
+        SharedCash -- every existing test constructs it this way) or a
+        SharedCash instance shared with a Portfolio (see
+        adaptive/portfolio.py's SharedCash docstring and
+        adaptive/runner.py, which is the only real caller passing a
+        shared instance)."""
+        if isinstance(start_capital_or_pool, SharedCash):
+            self._cash_pool = start_capital_or_pool
+        else:
+            self._cash_pool = SharedCash(float(start_capital_or_pool))
+        self.start_capital = self._cash_pool.balance
         self.leverage = leverage
         self.positions: Dict[str, ShortPosition] = {}
         self.realized_pnl = 0.0
         self.n_trades = 0
         self.wins = 0
-        self.peak_equity = start_capital_usdt
+        self.peak_equity = self._cash_pool.balance
         self.trade_log: List[dict] = []
+
+    @property
+    def cash(self) -> float:
+        return self._cash_pool.balance
+
+    @cash.setter
+    def cash(self, value: float):
+        self._cash_pool.balance = value
 
     def held_qty(self, symbol: str) -> float:
         p = self.positions.get(symbol)

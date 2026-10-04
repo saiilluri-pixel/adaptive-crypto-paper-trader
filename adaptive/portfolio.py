@@ -20,12 +20,48 @@ observed spread (~0.0096%) even against mid, so bid/ask-then-slippage is
 more conservative still.
 """
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 # Unused within this module (Portfolio is symbol-agnostic) -- kept only as
 # documentation, mirrored from adaptive/market_data.py's SYMBOLS, the
-# actual source of truth for the live trading universe.
-SYMBOLS = ("BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT")
+# actual source of truth for the live trading universe (now 20 symbols).
+SYMBOLS = (
+    "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT",
+    "NEAR/USDT", "UNI/USDT", "ARB/USDT", "DOGE/USDT", "SUI/USDT",
+    "ADA/USDT", "LINK/USDT", "AVAX/USDT", "AAVE/USDT", "TRX/USDT",
+    "LTC/USDT", "APT/USDT", "DOT/USDT", "INJ/USDT", "FIL/USDT",
+)
+
+
+@dataclass
+class SharedCash:
+    """ONE mutable USDT cash balance that can be referenced by BOTH the
+    Spot long Portfolio and the SIMULATED short ShortPortfolio (see
+    adaptive/short_portfolio.py) -- per explicit user request ("no money
+    split between short and long trades... first come first serve"): the
+    two books draw from and credit back to the SAME pool rather than each
+    owning a static pre-partitioned half.
+
+    The mechanism is entirely this object being shared by reference:
+    adaptive/runner.py's run_once_cycle() processes the long book's
+    entries, then the short book's, strictly sequentially and single-
+    threaded, so whichever book's entry logic runs first in a given cycle
+    and successfully sizes/fills a trade spends real shared capital
+    immediately -- a later entry attempt in the same or a later cycle
+    reads the correspondingly reduced live balance (via Portfolio.cash /
+    ShortPortfolio.cash, both properties backed by this object) and is
+    sized smaller or rejected outright if the pool is exhausted. No
+    additional coordination/locking code is needed beyond both books
+    holding a reference to the same instance.
+    """
+    balance: float
+
+    def to_dict(self) -> dict:
+        return {"balance": self.balance}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "SharedCash":
+        return cls(balance=d["balance"])
 
 
 @dataclass
@@ -49,15 +85,32 @@ class Position:
 
 
 class Portfolio:
-    def __init__(self, start_capital_usdt: float):
-        self.cash = start_capital_usdt
-        self.start_capital = start_capital_usdt
+    def __init__(self, start_capital_or_pool: Union[float, SharedCash]):
+        """Accepts either a plain float (this Portfolio gets its own
+        private SharedCash, today's original single-book behavior --
+        every existing test constructs it this way) or a SharedCash
+        instance (this Portfolio shares that pool's balance with
+        whatever else holds a reference to it, e.g. a ShortPortfolio --
+        see adaptive/runner.py)."""
+        if isinstance(start_capital_or_pool, SharedCash):
+            self._cash_pool = start_capital_or_pool
+        else:
+            self._cash_pool = SharedCash(float(start_capital_or_pool))
+        self.start_capital = self._cash_pool.balance
         self.positions: Dict[str, Position] = {}
         self.realized_pnl = 0.0
         self.n_trades = 0
         self.wins = 0
-        self.peak_equity = start_capital_usdt
+        self.peak_equity = self._cash_pool.balance
         self.trade_log: List[dict] = []
+
+    @property
+    def cash(self) -> float:
+        return self._cash_pool.balance
+
+    @cash.setter
+    def cash(self, value: float):
+        self._cash_pool.balance = value
 
     def held_qty(self, symbol: str) -> float:
         p = self.positions.get(symbol)

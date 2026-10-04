@@ -90,9 +90,15 @@ def test_fresh_system_can_take_its_first_short_via_exploration(tmp_path):
     assert runner.short_exploration_symbols == {"BTC/USDT"}
     # exploration-sized (<=0.10% of ~2708 equity => a few dollars), not normal (0.50%)
     assert pos.risk_amount_usdt < 10.0
-    # never touched the long book
+    # never opened any position on the long book...
     assert len(runner.portfolio.positions) == 0
-    assert runner.portfolio.cash == runner.portfolio.start_capital
+    # ...but DOES see the shared pool reduced by exactly the short's own
+    # margin+fee reservation -- cash is now one pool (per explicit user
+    # request: "no money split between short and long trades... first
+    # come first serve"), so a short-only trade is visible to the long
+    # book's own `.cash` even though the long book made no trade of its own.
+    assert runner.portfolio.cash == pytest.approx(
+        runner.portfolio.start_capital - (pos.margin_reserved + pos.entry_fee))
 
 
 def test_short_stop_out_closes_position_and_credits_cash(tmp_path):
@@ -287,6 +293,14 @@ def test_gap_does_not_block_short_stop_management(tmp_path):
 
 
 def test_snapshot_short_book_never_summed_into_long_equity(tmp_path):
+    """Since the shared-capital redesign, `short_book` no longer carries
+    its own cash/equity/return_pct/drawdown_pct/peak_equity -- those would
+    be misleading (ShortPortfolio.equity() reads the SAME pool the long
+    book also draws from, so a standalone "Short Book Equity" figure would
+    swing on the LONG book's trades too). The one honest, non-double-
+    counted system-wide figure lives at the top level (snap["equity"]),
+    built from adaptive.runner._combined_equity() -- shared cash counted
+    ONCE, not once per book."""
     now = BASE + 300 * HOUR
     ex = FakeExchange(now, candles_by_key=_full_candle_set(now))
     runner = AdaptiveRunner(str(tmp_path), market_data=MarketData(exchange=ex))
@@ -294,10 +308,12 @@ def test_snapshot_short_book_never_summed_into_long_equity(tmp_path):
     prices = {s: 100.0 for s in SYMBOLS}
     snap = runner.snapshot(prices)
     assert "short_book" in snap
-    assert snap["equity"] == pytest.approx(runner.portfolio.start_capital)  # long-only, unaffected
-    assert snap["short_book"]["equity"] == pytest.approx(runner.short_portfolio.start_capital)
+    for key in ("cash", "equity", "start_capital", "return_pct", "peak_equity", "drawdown_pct"):
+        assert key not in snap["short_book"]
+    assert snap["equity"] == pytest.approx(runner._combined_equity(prices))
+    assert snap["equity"] == pytest.approx(runner.portfolio.start_capital)  # flat book, no trades yet
     assert snap["short_book"]["leverage"] == runner.short_portfolio.leverage
-    for key in ("cash", "equity", "return_pct", "positions", "risk_state", "daily_pnl_usdt"):
+    for key in ("positions", "risk_state", "realized_pnl", "n_trades"):
         assert key in snap["short_book"]
 
 

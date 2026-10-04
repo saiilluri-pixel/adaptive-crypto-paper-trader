@@ -1,7 +1,8 @@
 """Deterministic tests for adaptive/portfolio.py's Spot-legal invariants."""
 import pytest
 
-from adaptive.portfolio import Portfolio
+from adaptive.portfolio import Portfolio, SharedCash
+from adaptive.short_portfolio import ShortPortfolio
 
 FEE = 0.001
 SLIP = 0.0002
@@ -131,3 +132,60 @@ def test_snapshot_reports_drawdown_and_allocation():
     assert "crypto_allocation_pct" in snap
     assert snap["crypto_allocation_pct"] > 0
     assert "BTC/USDT" in snap["positions"]
+
+
+# ── SharedCash: the money-pooling mechanism behind "no money split
+# between short and long trades... first come first serve" ─────────────
+def test_plain_float_construction_gets_its_own_private_pool():
+    """Backward-compat: passing a float (as every pre-existing test and
+    call site does) must behave exactly as before -- this Portfolio owns
+    its own cash, invisible to anything else."""
+    p1 = Portfolio(10000.0)
+    p2 = Portfolio(10000.0)
+    p1.buy("BTC/USDT", best_ask=100.0, notional_usdt=1000.0, fee_rate=FEE, slippage=SLIP,
+           ts_ms=1000, **_entry_meta())
+    assert p1.cash < 10000.0
+    assert p2.cash == 10000.0  # untouched -- separate pools
+
+
+def test_shared_pool_is_visible_to_both_portfolio_and_short_portfolio():
+    pool = SharedCash(2000.0)
+    long_book = Portfolio(pool)
+    short_book = ShortPortfolio(pool, leverage=2.0)
+    assert long_book.cash == 2000.0
+    assert short_book.cash == 2000.0
+
+    long_book.buy("BTC/USDT", best_ask=100.0, notional_usdt=500.0, fee_rate=FEE, slippage=SLIP,
+                  ts_ms=1000, **_entry_meta())
+    # the SHORT book must immediately see the reduced balance -- same pool
+    assert short_book.cash == pytest.approx(long_book.cash)
+    assert short_book.cash < 2000.0
+
+
+def test_short_book_spending_is_visible_to_long_book():
+    pool = SharedCash(2000.0)
+    long_book = Portfolio(pool)
+    short_book = ShortPortfolio(pool, leverage=2.0)
+    short_book.sell_to_open("BTC/USDT", best_bid=100.0, notional_usdt=500.0, fee_rate=FEE,
+                             slippage=SLIP, ts_ms=1000, strategy="trend_momentum", regime="TREND_DOWN",
+                             confidence=0.8, initial_stop_pct=5.0, risk_amount_usdt=10.0)
+    assert long_book.cash == pytest.approx(short_book.cash)
+    assert long_book.cash < 2000.0
+
+
+def test_first_come_first_serve_second_book_sees_reduced_room():
+    """The essence of the redesign: whichever book spends FIRST in a
+    cycle leaves genuinely less for the other -- no artificial per-book
+    ceiling blocks one side from using capital the other isn't touching."""
+    pool = SharedCash(1000.0)
+    long_book = Portfolio(pool)
+    short_book = ShortPortfolio(pool, leverage=2.0)
+    # long spends almost everything
+    long_book.buy("BTC/USDT", best_ask=100.0, notional_usdt=950.0, fee_rate=FEE, slippage=SLIP,
+                  ts_ms=1000, **_entry_meta())
+    remaining = short_book.cash
+    assert remaining < 60.0  # only the leftover sliver is available now
+    with pytest.raises(ValueError):
+        short_book.sell_to_open("ETH/USDT", best_bid=100.0, notional_usdt=500.0, fee_rate=FEE,
+                                 slippage=SLIP, ts_ms=1000, strategy="trend_momentum", regime="TREND_DOWN",
+                                 confidence=0.8, initial_stop_pct=5.0, risk_amount_usdt=10.0)

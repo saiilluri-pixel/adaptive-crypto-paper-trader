@@ -32,20 +32,28 @@ class DegradationState(Enum):
     HALTED = "HALTED"
 
 
+# CAUTION/DEFENSIVE multipliers raised (0.50->0.75, 0.25->0.60) per explicit
+# user request for more aggressive trading -- both books were observed
+# sitting in DEFENSIVE/CAUTION off small, noisy early sample sizes (10-20
+# trades), which was throttling position size to a quarter of normal right
+# when "aggressive" was asked for. HALTED stays 0.0 -- that state exists to
+# fully stop new entries after a real breaker trip (max drawdown/daily
+# loss/loss streak, see RiskLimits below), not to be softened.
 STATE_RISK_MULTIPLIER = {
     DegradationState.NORMAL: 1.00,
-    DegradationState.CAUTION: 0.50,
-    DegradationState.DEFENSIVE: 0.25,
+    DegradationState.CAUTION: 0.75,
+    DegradationState.DEFENSIVE: 0.60,
     DegradationState.HALTED: 0.0,
 }
 # "only highest-confidence entries" in DEFENSIVE; HALTED's floor is
 # unreachable (>1.0) so no confidence value can pass it -- redundant with
 # the risk multiplier being 0, but explicit rather than relying on that
-# alone in case a caller ever forgets to check `approved`.
+# alone in case a caller ever forgets to check `approved`. DEFENSIVE floor
+# lowered 0.65->0.45 alongside the multiplier change above, same reason.
 STATE_MIN_CONFIDENCE = {
     DegradationState.NORMAL: 0.0,
     DegradationState.CAUTION: 0.0,
-    DegradationState.DEFENSIVE: 0.65,
+    DegradationState.DEFENSIVE: 0.45,
     DegradationState.HALTED: 1.01,
 }
 
@@ -68,26 +76,43 @@ MAX_EXPLORATION_POSITIONS = 5
 # Confidence-scaled exploration risk: a signal right at the eligibility
 # floor (MIN_EXPLORATION_SIGNAL_STRENGTH in meta_controller.py) risks the
 # MIN fraction; a maximum-strength (1.0) signal risks the MAX fraction.
-# Raised from 0.05/0.10 to 0.08/0.15 per explicit user request to deploy
-# more capital sooner while stats are still cold (cells with zero live
-# trades) -- a deliberate, disclosed increase in per-trade exploration
-# risk, not just trade count. Still well below the normal 0.50%
-# risk_per_trade_pct: exploration positions remain smaller than
-# normally-scored ones even after this increase.
-EXPLORATION_RISK_MIN_PCT = 0.08
-EXPLORATION_RISK_MAX_PCT = 0.15
+# Raised 0.08/0.15 -> 0.20/0.40 per explicit user request for aggressive
+# trading -- a further deliberate, disclosed increase in per-trade
+# exploration risk, not just trade count. Still below the normal (now
+# aggressive) 1.75% risk_per_trade_pct: exploration positions remain
+# smaller than normally-scored ones even after this increase.
+EXPLORATION_RISK_MIN_PCT = 0.20
+EXPLORATION_RISK_MAX_PCT = 0.40
 
 
 @dataclass
 class RiskLimits:
-    risk_per_trade_pct: float = 0.50
-    max_portfolio_heat_pct: float = 1.50
-    max_symbol_allocation_pct: float = 40.0
-    max_total_crypto_allocation_pct: float = 90.0
-    daily_loss_limit_pct: float = 2.0
-    max_drawdown_limit_pct: float = 10.0
-    consecutive_loss_breaker: int = 5
-    min_cash_reserve_pct: float = 10.0
+    # Aggressive-trading tier per explicit user request (2026-09-17),
+    # roughly 3-4x the prior conservative defaults:
+    #   risk_per_trade_pct        0.50  -> 1.75
+    #   max_portfolio_heat_pct    1.50  -> 9.00  (sized so ~5 concurrent
+    #                                              full-risk positions,
+    #                                              MAX_POSITIONS in
+    #                                              runner.py, don't
+    #                                              themselves become the
+    #                                              binding constraint --
+    #                                              5 * 1.75% ~= 8.75%)
+    #   max_symbol_allocation_pct 40.0  -> 55.0
+    #   max_total_crypto_allocation_pct 90.0 -> 95.0
+    #   daily_loss_limit_pct      2.0   -> 6.0   (breaker loosened too,
+    #                                              per explicit request)
+    #   max_drawdown_limit_pct    10.0  -> 25.0  (same)
+    #   consecutive_loss_breaker  5     -> 8     (same)
+    #   min_cash_reserve_pct      10.0  -> 5.0   (allow more of the pool
+    #                                              to be deployed)
+    risk_per_trade_pct: float = 1.75
+    max_portfolio_heat_pct: float = 9.00
+    max_symbol_allocation_pct: float = 55.0
+    max_total_crypto_allocation_pct: float = 95.0
+    daily_loss_limit_pct: float = 6.0
+    max_drawdown_limit_pct: float = 25.0
+    consecutive_loss_breaker: int = 8
+    min_cash_reserve_pct: float = 5.0
 
 
 @dataclass
@@ -108,18 +133,32 @@ class RiskEngine:
     # ── position sizing ──────────────────────────────────────────────
     def size_entry(self, *, equity: float, cash: float, current_portfolio_heat_usdt: float,
                     current_crypto_value_usdt: float, stop_distance_frac: float,
-                    confidence: float, risk_pct_override: Optional[float] = None) -> SizingResult:
+                    confidence: float, risk_pct_override: Optional[float] = None,
+                    enforce_confidence_floor: bool = True) -> SizingResult:
         """risk_pct_override: used only by size_exploration_entry() below to
-        substitute EXPLORATION_RISK_PER_TRADE_PCT for the normal
-        risk_per_trade_pct -- every other check (degradation state,
-        confidence floor, all four caps) is identical for an exploration
-        entry, so this is the only thing that differs."""
+        substitute the exploration risk fraction for the normal
+        risk_per_trade_pct.
+
+        enforce_confidence_floor: normally True. size_exploration_entry()
+        passes False, because an EXPLORATION entry is by construction a
+        first-observation trade on a never-traded (n=0) cell, whose
+        confidence (= 1 - uncertainty) is ~0.0 -- so the degradation-state
+        confidence floor (meant to restrict CONVICTION-SCORED normal
+        entries during a drawdown) would reject EVERY exploration entry the
+        moment the book enters DEFENSIVE/CAUTION, silently freezing the
+        data-gathering mechanism exactly when the book is stuck and most
+        needs it (observed live: 304 consecutive exploration rejections,
+        'confidence 0.00 below DEFENSIVE floor 0.45', book pinned in
+        DEFENSIVE). Exploration still respects the HALTED hard-stop (risk
+        multiplier 0 -> not approved, checked below) and the state's risk
+        multiplier (0.60 in DEFENSIVE), so it stays tiny -- it just isn't
+        gated by a conviction threshold it can never meet by design."""
         limits = self.limits
         mult = STATE_RISK_MULTIPLIER[self.state]
         if mult <= 0:
             return SizingResult(False, 0.0, 0.0, "degradation_state",
                                  f"state={self.state.value} blocks new entries")
-        if confidence < STATE_MIN_CONFIDENCE[self.state]:
+        if enforce_confidence_floor and confidence < STATE_MIN_CONFIDENCE[self.state]:
             return SizingResult(False, 0.0, 0.0, "degradation_state_confidence",
                                  f"confidence {confidence:.2f} below {self.state.value} "
                                  f"floor {STATE_MIN_CONFIDENCE[self.state]:.2f}")
@@ -183,7 +222,7 @@ class RiskEngine:
                                   current_portfolio_heat_usdt=current_portfolio_heat_usdt,
                                   current_crypto_value_usdt=current_crypto_value_usdt,
                                   stop_distance_frac=stop_distance_frac, confidence=confidence,
-                                  risk_pct_override=risk_pct)
+                                  risk_pct_override=risk_pct, enforce_confidence_floor=False)
         if result.approved:
             result.binding_constraint = "exploration:" + result.binding_constraint
         return result
@@ -217,10 +256,21 @@ class RiskEngine:
         limits = self.limits
         if drawdown_pct >= limits.max_drawdown_limit_pct or loss_streak >= limits.consecutive_loss_breaker:
             return DegradationState.HALTED
-        if (recent_expectancy is not None and recent_expectancy < 0) or \
-           (recent_pf is not None and recent_pf < 0.8):
+        # Aggressive-profile recalibration (2026-09-20, per explicit user
+        # request): the prior thresholds sent the book to full DEFENSIVE on
+        # ANY negative recent expectancy (or PF < 0.8), which pinned it there
+        # ~53% of cycles and, combined with the confidence floor, froze all
+        # new entries. Now only a DECISIVELY losing book (profit factor
+        # < 0.6 -- losses ~1.7x wins) goes DEFENSIVE; a mildly negative /
+        # breakeven book sits in CAUTION (0.75x sizing) instead of DEFENSIVE
+        # (0.60x), keeping more capital deployed. The hard breakers above
+        # (drawdown, loss-streak -> HALTED) are unchanged -- this only moves
+        # the softer degradation tiers. Tradeoff: the book will keep betting
+        # through moderate drawdowns rather than throttling early. That is
+        # what "aggressive" means and is the explicit, disclosed intent.
+        if recent_pf is not None and recent_pf < 0.6:
             return DegradationState.DEFENSIVE
-        if recent_pf is not None and recent_pf < 1.1:
+        if recent_pf is not None and recent_pf < 1.0:
             return DegradationState.CAUTION
         return DegradationState.NORMAL
 

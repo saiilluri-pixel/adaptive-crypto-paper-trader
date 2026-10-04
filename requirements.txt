@@ -1,0 +1,6 @@
+ccxt==4.5.59
+numpy==2.2.6
+pandas==2.3.3
+requests==2.32.4
+scipy==1.15.3
+matplotlib==3.10.9

@@ -34,6 +34,16 @@ SERVICE_LABELS = {
     "shocksol": "com.btcpaper.shocksol",
 }
 
+# Cloud deployment (systemd, not launchd) equivalents of the labels above --
+# only the services this system's own setup.sh installs have an entry;
+# legacy_bot/shocksol are never deployed to the cloud VM, so they fall
+# through to UNKNOWN there exactly as they did before this mapping existed.
+SYSTEMD_UNIT_MAP = {
+    "com.btcpaper.adaptive": "btc-adaptive.service",
+    "com.btcpaper.adaptive.research": "btc-adaptive-research.service",
+    "com.btcpaper.adaptive.dashboard": "btc-adaptive-dashboard.service",
+}
+
 
 def _read_json(path):
     try:
@@ -86,7 +96,11 @@ def _service_status(label):
     """Exact match on launchctl's tab-separated Label column -- a substring/
     endswith check would incorrectly match "com.btcpaper.adaptive" against
     the "com.btcpaper.adaptive.research" line (which contains it as a
-    prefix), conflating the two services' PIDs."""
+    prefix), conflating the two services' PIDs.
+
+    Falls back to systemd (SYSTEMD_UNIT_MAP) when launchctl isn't installed
+    -- i.e. this is the cloud VM, not the original macOS host -- so the
+    dashboard shows real RUNNING/STOPPED there too, not UNKNOWN forever."""
     try:
         out = subprocess.run(["launchctl", "list"], capture_output=True, text=True, timeout=5).stdout
         for line in out.splitlines():
@@ -94,6 +108,20 @@ def _service_status(label):
             if len(parts) >= 3 and parts[-1] == label:
                 return ("RUNNING", parts[0]) if parts[0] != "-" else ("STOPPED", None)
         return "STOPPED", None
+    except FileNotFoundError:
+        unit = SYSTEMD_UNIT_MAP.get(label)
+        if not unit:
+            return "UNKNOWN", None
+        try:
+            state = subprocess.run(["systemctl", "is-active", unit],
+                                    capture_output=True, text=True, timeout=5).stdout.strip()
+            if state != "active":
+                return "STOPPED", None
+            pid = subprocess.run(["systemctl", "show", unit, "-p", "MainPID", "--value"],
+                                  capture_output=True, text=True, timeout=5).stdout.strip()
+            return "RUNNING", (pid or None)
+        except Exception:
+            return "UNKNOWN", None
     except Exception:
         return "UNKNOWN", None
 
@@ -121,7 +149,7 @@ def _risk_limits():
 
 
 STRATEGIES = ("trend_momentum", "volatility_breakout", "mean_reversion", "shock_continuation",
-              "atr_trailing_stop")
+              "atr_trailing_stop", "cross_sectional")
 
 
 def _strategy_performance(all_decisions, all_trades, positions, champions, candidates_key="candidates"):
@@ -384,6 +412,31 @@ function pill(status, pid){
   return `<span class="pill ${cls}">${status}${pid?(' · pid '+pid):''}</span>`;
 }
 
+// Per-candidate score breakdown table (observability upgrade F1). Reads the
+// full decomposition now written into each cycle_ranking event's candidates/
+// short_candidates by runner._opp_record(). Read-only, gracefully shows
+// "none this cycle" when the market produced no candidates.
+function candidateRows(list, side){
+  return (list||[]).map(c=>`<tr>
+    <td>${esc(c.symbol)}</td><td>${side}</td><td>${esc(c.strategy)}</td><td>${esc(c.regime)}</td>
+    <td class="${cls(c.score)}">${fmt(c.score,4)}</td>
+    <td>${fmt(c.shrunk_edge,4)}</td><td>${fmt(c.signal_strength,2)}</td><td>${fmt(c.regime_fit,2)}</td>
+    <td>${fmt(c.robustness,2)}</td><td class="neg">${fmt(c.friction_penalty,4)}</td>
+    <td class="neg">${fmt(c.uncertainty_penalty,4)}</td><td class="neg">${fmt(c.drawdown_penalty,4)}</td>
+    <td class="neg">${fmt(c.correlation_penalty,4)}</td><td>${fmt(c.confidence,2)}</td>
+    <td>${c.is_exploration_eligible?'yes':'no'}</td></tr>`).join('');
+}
+function renderCandidateBreakdown(r){
+  const longs=(r&&r.candidates)||[], shorts=(r&&r.short_candidates)||[];
+  if(!longs.length && !shorts.length) return '<div class="muted" style="margin-top:6px;">none this cycle</div>';
+  return `<div style="overflow-x:auto;"><table style="margin-top:6px; font-size:11px;"><thead><tr>
+    <th>Symbol</th><th>Side</th><th>Strategy</th><th>Regime</th><th>Score</th><th>ShrunkEdge</th>
+    <th>Strength</th><th>RegFit</th><th>Robust</th><th>Friction</th><th>Uncert</th><th>DD</th>
+    <th>Corr</th><th>Conf</th><th>Explore</th></tr></thead><tbody>`
+    + candidateRows(longs,'<span class=pos>LONG</span>') + candidateRows(shorts,'<span class=neg>SHORT</span>')
+    + '</tbody></table></div>';
+}
+
 function renderLog(elId, lines){
   const el = document.getElementById(elId);
   if(!lines || lines.length===0){ el.innerHTML = '<span class="muted">no log lines yet</span>'; return; }
@@ -413,9 +466,10 @@ async function refresh(){
 
   const p = d.portfolio || {};
   document.getElementById('portfolio-cards').innerHTML = `
-    <div class="card"><div class="stat-label">Total Equity</div><div class="stat-value">$${fmt(p.equity)}</div></div>
+    <div class="card" style="border:1px solid var(--dim);"><div class="stat-label">All-Time Realized P&amp;L <span class="muted" style="font-size:9px;">(banked, closed trades)</span></div><div class="stat-value ${cls(p.realized_pnl_combined)}">$${fmt(p.realized_pnl_combined)} <span style="font-size:13px;">(${pct(p.realized_return_pct)})</span></div><div class="muted" style="font-size:10px;">long $${fmt(p.realized_pnl_long)} · short $${fmt(p.realized_pnl_short)} · ${fmt(p.n_trades_combined,0)} trades · ${pct(p.win_rate_pct,0)} win</div></div>
+    <div class="card"><div class="stat-label">Total Equity <span class="muted" style="font-size:9px;">(incl. unrealized)</span></div><div class="stat-value">$${fmt(p.equity)}</div></div>
     <div class="card"><div class="stat-label">Available USDT Cash</div><div class="stat-value">$${fmt(p.cash)}</div></div>
-    <div class="card"><div class="stat-label">Total Return</div><div class="stat-value ${cls(p.return_pct)}">${pct(p.return_pct)}</div></div>
+    <div class="card"><div class="stat-label">Total Return <span class="muted" style="font-size:9px;">(incl. unrealized)</span></div><div class="stat-value ${cls(p.return_pct)}">${pct(p.return_pct)}</div></div>
     <div class="card"><div class="stat-label">Daily PnL</div><div class="stat-value ${cls(p.daily_pnl_usdt)}">$${fmt(p.daily_pnl_usdt)} (${pct(p.daily_pnl_pct)})</div></div>
     <div class="card"><div class="stat-label">Drawdown</div><div class="stat-value ${p.drawdown_pct>0?'neg':'neu'}">${pct(p.drawdown_pct)}</div></div>
     <div class="card"><div class="stat-label">Portfolio Heat</div><div class="stat-value">${pct(p.portfolio_heat_pct)}</div></div>
@@ -476,18 +530,24 @@ async function refresh(){
   // table above -- see adaptive/short_portfolio.py for the simulation's
   // disclosed approximations (fixed leverage, maintenance-buffer
   // liquidation, flat daily borrow-cost).
+  // Cash/equity/return/drawdown are NOT shown here -- since the shared-
+  // capital redesign ("no money split between short and long trades...
+  // first come first serve"), this book's cash IS the long book's cash
+  // (one pool), so a standalone short-side equity/return/drawdown figure
+  // would just restate -- misleadingly, in isolation -- the SAME top-level
+  // Portfolio card above. Realized PnL/trade count/margin-in-use below are
+  // genuinely short-specific and unaffected by cash-sharing.
   const sb = p.short_book || {};
+  const shortPositions = sb.positions || {};
+  const shortMarginReserved = Object.values(shortPositions).reduce((sum, pos) => sum + (pos.margin_reserved||0), 0);
   document.getElementById('short-cards').innerHTML = `
-    <div class="card"><div class="stat-label">Short Book Equity</div><div class="stat-value">$${fmt(sb.equity)}</div></div>
-    <div class="card"><div class="stat-label">Short Book Cash (margin free)</div><div class="stat-value">$${fmt(sb.cash)}</div></div>
-    <div class="card"><div class="stat-label">Short Book Return</div><div class="stat-value ${cls(sb.return_pct)}">${pct(sb.return_pct)}</div></div>
-    <div class="card"><div class="stat-label">Short Daily PnL</div><div class="stat-value ${cls(sb.daily_pnl_usdt)}">$${fmt(sb.daily_pnl_usdt)} (${pct(sb.daily_pnl_pct)})</div></div>
-    <div class="card"><div class="stat-label">Short Drawdown</div><div class="stat-value ${sb.drawdown_pct>0?'neg':'neu'}">${pct(sb.drawdown_pct)}</div></div>
-    <div class="card"><div class="stat-label">Short Portfolio Heat</div><div class="stat-value">${pct(sb.portfolio_heat_pct)}</div></div>
+    <div class="card"><div class="stat-label">Short Realized PnL</div><div class="stat-value ${cls(sb.realized_pnl)}">$${fmt(sb.realized_pnl)}</div></div>
+    <div class="card"><div class="stat-label">Short Trades (Wins)</div><div class="stat-value">${fmt(sb.n_trades,0)} (${fmt(sb.wins,0)})</div></div>
+    <div class="card"><div class="stat-label">Margin In Use</div><div class="stat-value">$${fmt(shortMarginReserved)} <span class="muted" style="font-size:11px;">of shared pool</span></div></div>
     <div class="card"><div class="stat-label">Leverage</div><div class="stat-value">${sb.leverage?sb.leverage.toFixed(1)+'x':'<span class=na>—</span>'} <span class="muted" style="font-size:11px;">(simulated)</span></div></div>
     <div class="card"><div class="stat-label">Short Risk State</div><div class="stat-value">${esc(sb.risk_state||'—')}</div></div>
+    <div class="card"><div class="stat-label">Cash &amp; Equity</div><div class="stat-value na" style="font-size:13px;">shared with long book — see Portfolio card above</div></div>
   `;
-  const shortPositions = sb.positions || {};
   const shortPosKeys = Object.keys(shortPositions);
   if(shortPosKeys.length===0){
     document.getElementById('short-positions').innerHTML = '<div class="flatnote">NO OPEN SHORT POSITION</div>';
@@ -523,14 +583,14 @@ async function refresh(){
     </div>
     <div style="margin-top:14px; font-weight:600;">AI CURRENTLY WANTS: ${desired===null||desired===undefined?'<span class=na>—</span>':desired} / 3 POSITIONS</div>
     <div class="muted">"${desired===0?'0 positions — '+desiredReason:desiredReason}"</div>
-    <div style="margin-top:14px;" class="muted">Per-candidate score breakdown (expected edge, regime fit, robustness, friction/correlation penalty) is not
-    currently written to decisions.jsonl by the running process -- only symbol/strategy/score are logged per cycle-ranking event.
-    Latest candidates: ${d.last_ranking && d.last_ranking.candidates && d.last_ranking.candidates.length ? d.last_ranking.candidates.map(c=>esc(c.symbol)+'/'+esc(c.strategy)+' score='+fmt(c.score,3)).join(', ') : '<span class=na>none this cycle</span>'}</div>
+    <div style="margin-top:14px; font-weight:600;">Latest candidate score breakdown</div>
+    <div class="muted" style="font-size:11px;">score = shrunk_edge × strength × regime_fit × robustness − friction − uncertainty − drawdown − correlation</div>
+    ${renderCandidateBreakdown(d.last_ranking)}
   `;
 
   // Strategy brain -- inferred only from the latest cycle's candidate list (real data), never fabricated BULLISH/BEARISH
   const activeStrats = new Set((d.last_ranking && d.last_ranking.candidates || []).map(c=>c.symbol+'|'+c.strategy));
-  const strategies = ['trend_momentum','volatility_breakout','mean_reversion','shock_continuation','atr_trailing_stop'];
+  const strategies = ['trend_momentum','volatility_breakout','mean_reversion','shock_continuation','atr_trailing_stop','cross_sectional'];
   document.getElementById('strategy-brain').innerHTML = `<table><thead><tr><th>Strategy</th>${syms.map(s=>`<th>${s}</th>`).join('')}</tr></thead><tbody>` +
     strategies.map(st => `<tr><td>${st}</td>` + syms.map(s => {
       const active = activeStrats.has(s+'|'+st);

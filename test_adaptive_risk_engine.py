@@ -9,7 +9,10 @@ def _engine(**overrides):
 
 
 def test_risk_budget_sizing_basic():
-    eng = _engine()
+    # Pinned risk_per_trade_pct rather than relying on RiskLimits' deployed
+    # default -- this test is about the sizing FORMULA (risk_amount =
+    # equity * risk_pct/100), not "what is today's deployed config."
+    eng = _engine(risk_per_trade_pct=0.50)
     r = eng.size_entry(equity=10000, cash=10000, current_portfolio_heat_usdt=0,
                         current_crypto_value_usdt=0, stop_distance_frac=0.05, confidence=0.8)
     assert r.approved
@@ -123,11 +126,21 @@ def test_degradation_normal_by_default_with_insufficient_sample():
     assert state == DegradationState.NORMAL
 
 
-def test_degradation_defensive_on_negative_expectancy():
+def test_degradation_tiers_by_profit_factor():
+    """Aggressive-profile calibration: DEFENSIVE only for a decisively
+    losing book (PF < 0.6); a mildly negative/breakeven book (0.6 <= PF <
+    1.0) sits in CAUTION, not DEFENSIVE; PF >= 1.0 is NORMAL. Expectancy no
+    longer independently forces DEFENSIVE."""
     eng = _engine()
-    state = eng.evaluate_degradation(drawdown_pct=1.0, loss_streak=0,
-                                      recent_expectancy=-5.0, recent_pf=0.9)
-    assert state == DegradationState.DEFENSIVE
+    d = eng.evaluate_degradation(drawdown_pct=1.0, loss_streak=0,
+                                  recent_expectancy=-5.0, recent_pf=0.5)
+    assert d == DegradationState.DEFENSIVE          # PF 0.5 < 0.6
+    c = eng.evaluate_degradation(drawdown_pct=1.0, loss_streak=0,
+                                  recent_expectancy=-5.0, recent_pf=0.9)
+    assert c == DegradationState.CAUTION            # mildly negative -> CAUTION, not DEFENSIVE
+    n = eng.evaluate_degradation(drawdown_pct=1.0, loss_streak=0,
+                                  recent_expectancy=-0.1, recent_pf=1.05)
+    assert n == DegradationState.NORMAL             # PF >= 1.0 -> NORMAL even if expectancy slightly <0
 
 
 def test_degradation_halted_on_drawdown_limit():
@@ -153,19 +166,22 @@ def test_halted_state_blocks_all_new_entries_regardless_of_confidence():
 
 
 def test_exploration_risk_capped_at_max_pct_for_full_strength_signal():
+    # References the live constant rather than hardcoding its value -- this
+    # is a mechanism test ("is exploration capped at the configured max"),
+    # not an assertion about what that max currently is.
     from adaptive.risk_engine import EXPLORATION_RISK_MAX_PCT
-    assert EXPLORATION_RISK_MAX_PCT == pytest.approx(0.15)
     eng = _engine()
     r = eng.size_exploration_entry(equity=10000, cash=10000, current_portfolio_heat_usdt=0,
                                     current_crypto_value_usdt=0, stop_distance_frac=0.05, confidence=0.8,
                                     signal_strength=1.0)
     assert r.approved
-    assert r.risk_amount_usdt == pytest.approx(10000 * 0.0015)  # 0.15% of equity at max strength
+    assert r.risk_amount_usdt == pytest.approx(10000 * EXPLORATION_RISK_MAX_PCT / 100.0)
     assert r.binding_constraint.startswith("exploration:")
 
 
 def test_exploration_risk_scales_with_signal_strength():
     from adaptive.meta_controller import MIN_EXPLORATION_SIGNAL_STRENGTH
+    from adaptive.risk_engine import EXPLORATION_RISK_MIN_PCT, EXPLORATION_RISK_MAX_PCT
     eng = _engine()
     weak = eng.size_exploration_entry(equity=10000, cash=10000, current_portfolio_heat_usdt=0,
                                        current_crypto_value_usdt=0, stop_distance_frac=0.05, confidence=0.8,
@@ -173,21 +189,23 @@ def test_exploration_risk_scales_with_signal_strength():
     strong = eng.size_exploration_entry(equity=10000, cash=10000, current_portfolio_heat_usdt=0,
                                          current_crypto_value_usdt=0, stop_distance_frac=0.05, confidence=0.8,
                                          signal_strength=1.0)
-    assert weak.risk_amount_usdt == pytest.approx(10000 * 0.0008)  # EXPLORATION_RISK_MIN_PCT
-    assert strong.risk_amount_usdt == pytest.approx(10000 * 0.0015)  # EXPLORATION_RISK_MAX_PCT
+    assert weak.risk_amount_usdt == pytest.approx(10000 * EXPLORATION_RISK_MIN_PCT / 100.0)
+    assert strong.risk_amount_usdt == pytest.approx(10000 * EXPLORATION_RISK_MAX_PCT / 100.0)
     assert weak.risk_amount_usdt < strong.risk_amount_usdt
 
 
 def test_exploration_risk_smaller_than_normal_at_max_strength():
-    eng = _engine()
+    # Pinned risk_per_trade_pct -- this test is about the RATIO relationship
+    # (exploration always stays below normal sizing), not today's exact
+    # deployed numbers.
+    from adaptive.risk_engine import EXPLORATION_RISK_MAX_PCT
+    eng = _engine(risk_per_trade_pct=0.50)
     normal = eng.size_entry(equity=10000, cash=10000, current_portfolio_heat_usdt=0,
                              current_crypto_value_usdt=0, stop_distance_frac=0.05, confidence=0.8)
     exploration = eng.size_exploration_entry(equity=10000, cash=10000, current_portfolio_heat_usdt=0,
                                               current_crypto_value_usdt=0, stop_distance_frac=0.05, confidence=0.8,
                                               signal_strength=1.0)
-    # 0.15% exploration vs 0.50% normal risk_per_trade_pct -- still meaningfully
-    # smaller even after being raised, never as large as a normally-scored entry
-    assert exploration.risk_amount_usdt == pytest.approx(normal.risk_amount_usdt * 0.15 / 0.50)
+    assert exploration.risk_amount_usdt == pytest.approx(normal.risk_amount_usdt * EXPLORATION_RISK_MAX_PCT / 0.50)
     assert exploration.risk_amount_usdt < normal.risk_amount_usdt
 
 
@@ -202,7 +220,8 @@ def test_exploration_still_respects_portfolio_heat_cap():
 
 def test_exploration_blocked_in_halted_state():
     """Normal risk guards still apply to exploration -- it never bypasses
-    basic risk management, including the degradation state machine."""
+    basic risk management, including the degradation state machine's HALTED
+    hard-stop (risk multiplier 0)."""
     eng = _engine()
     eng.set_state(DegradationState.HALTED, "test")
     r = eng.size_exploration_entry(equity=10000, cash=10000, current_portfolio_heat_usdt=0,
@@ -211,8 +230,43 @@ def test_exploration_blocked_in_halted_state():
     assert not r.approved
 
 
-def test_defensive_state_requires_high_confidence():
+def test_exploration_not_blocked_by_defensive_confidence_floor(monkeypatch):
+    """Regression for the DEFENSIVE deadlock: an exploration entry (confidence
+    ~0.0 by construction -- n=0 cell) must NOT be rejected by the DEFENSIVE
+    confidence floor, or the data-gathering mechanism freezes exactly when
+    the book is stuck in DEFENSIVE (observed live: 304 consecutive
+    'confidence 0.00 below DEFENSIVE floor 0.45' rejections). A NORMAL entry
+    at the same ~0 confidence IS still rejected -- the exemption is
+    exploration-only."""
+    import adaptive.risk_engine as rm
+    monkeypatch.setitem(rm.STATE_MIN_CONFIDENCE, DegradationState.DEFENSIVE, 0.45)
+    monkeypatch.setitem(rm.STATE_RISK_MULTIPLIER, DegradationState.DEFENSIVE, 0.60)
     eng = _engine()
+    eng.set_state(DegradationState.DEFENSIVE, "test")
+    # exploration at confidence 0.0 -> APPROVED (floor exempt), still tiny
+    expl = eng.size_exploration_entry(equity=10000, cash=10000, current_portfolio_heat_usdt=0,
+                                       current_crypto_value_usdt=0, stop_distance_frac=0.05, confidence=0.0,
+                                       signal_strength=1.0)
+    assert expl.approved
+    assert expl.risk_amount_usdt > 0
+    # a NORMAL entry at the same 0.0 confidence is still blocked by the floor
+    norm = eng.size_entry(equity=10000, cash=10000, current_portfolio_heat_usdt=0,
+                           current_crypto_value_usdt=0, stop_distance_frac=0.05, confidence=0.0)
+    assert not norm.approved
+    assert norm.binding_constraint == "degradation_state_confidence"
+
+
+def test_defensive_state_requires_high_confidence(monkeypatch):
+    # Monkeypatched to a known floor/multiplier rather than deriving both
+    # the test inputs AND the assertion from the live module dict -- doing
+    # that would make the test tautological (it'd "pass" for any floor,
+    # including 0.0, since low_conf's confidence would track the floor
+    # down with it). This pins the mechanism independent of today's
+    # deployed DEFENSIVE values.
+    import adaptive.risk_engine as risk_engine_mod
+    monkeypatch.setitem(risk_engine_mod.STATE_MIN_CONFIDENCE, DegradationState.DEFENSIVE, 0.65)
+    monkeypatch.setitem(risk_engine_mod.STATE_RISK_MULTIPLIER, DegradationState.DEFENSIVE, 0.25)
+    eng = _engine(risk_per_trade_pct=0.50)
     eng.set_state(DegradationState.DEFENSIVE, "test")
     low_conf = eng.size_entry(equity=10000, cash=10000, current_portfolio_heat_usdt=0,
                                current_crypto_value_usdt=0, stop_distance_frac=0.05, confidence=0.5)
@@ -220,4 +274,4 @@ def test_defensive_state_requires_high_confidence():
                                 current_crypto_value_usdt=0, stop_distance_frac=0.05, confidence=0.9)
     assert not low_conf.approved
     assert high_conf.approved
-    assert high_conf.risk_amount_usdt == pytest.approx(10000 * 0.005 * 0.25)  # DEFENSIVE = 25% risk
+    assert high_conf.risk_amount_usdt == pytest.approx(10000 * 0.005 * 0.25)

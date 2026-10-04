@@ -63,3 +63,20 @@ env/
 
 # OS
 .DS_Store
+
+# ── additions for public open-source push (2026-10-04) ──
+# Whole adaptive runtime dir = regenerated data only (state, logs, champion
+# files, decisions, AND the 25MB deep_history/ OHLCV+funding cache pulled
+# from the public Binance API). None of it is source-of-truth.
+adaptive_runtime/
+
+# Trend-filtered basket paper-trader: publish the CODE (trend_basket_paper.py),
+# never the live ledger / daily log / cron output.
+trend_basket/ledger.json
+trend_basket/ledger.json.tmp
+trend_basket/daily_log.csv
+trend_basket/cron.out
+trend_basket/cron.err
+
+# any stray logs
+*.log
